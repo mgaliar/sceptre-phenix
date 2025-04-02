@@ -9,9 +9,10 @@ import (
 	"strings"
 	"sync"
 
+	"phenix/util/plog"
 	"phenix/web/broker"
+	bt "phenix/web/broker/brokertypes"
 
-	log "github.com/activeshadow/libminimega/minilog"
 	"github.com/creack/pty"
 )
 
@@ -55,8 +56,6 @@ var (
 var ErrTerminalNotFound = fmt.Errorf("web terminal not found")
 
 func CreateWebTerminal(ctx context.Context, exp string, run, loop int, stage, name, dir, cmd string, args []string, envs ...string) (chan struct{}, error) {
-	log.Debug("CreateWebTerminal function called")
-
 	term := newWebTerm(exp, run, loop, stage, name)
 
 	c := exec.CommandContext(ctx, cmd, args...)
@@ -71,7 +70,7 @@ func CreateWebTerminal(ctx context.Context, exp string, run, loop int, stage, na
 	term.Pty = tty
 	term.Pid = c.Process.Pid
 
-	log.Info("spawned new %s terminal, pid = %v", cmd, term.Pid)
+	plog.Info("spawned new terminal", "cmd", cmd, "pid", term.Pid)
 
 	webTermMu.Lock()
 	webTermsPid[term.Pid] = term
@@ -92,7 +91,7 @@ func CreateWebTerminal(ctx context.Context, exp string, run, loop int, stage, na
 
 	broker.Broadcast(
 		nil, // TODO
-		broker.NewResource("apps/scorch", exp, "terminal-create"),
+		bt.NewResource("apps/scorch", exp, "terminal-create"),
 		body,
 	)
 
@@ -109,7 +108,7 @@ func KillTerminal(term WebTerm) error {
 
 	broker.Broadcast(
 		nil, // TODO
-		broker.NewResource("apps/scorch", term.Exp, "terminal-exit"),
+		bt.NewResource("apps/scorch", term.Exp, "terminal-exit"),
 		nil,
 	)
 
@@ -123,7 +122,7 @@ func KillTerminal(term WebTerm) error {
 	proc.Kill()
 	proc.Wait()
 
-	log.Debug("process %d killed", term.Pid)
+	plog.Debug("process killed", "pid", term.Pid)
 
 	return nil
 }

@@ -3,6 +3,7 @@ package broker
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -10,11 +11,14 @@ import (
 	"phenix/app"
 	"phenix/util/pubsub"
 	"phenix/web/util"
+
+	putil "phenix/util"
+	bt "phenix/web/broker/brokertypes"
 )
 
 var (
 	clients    = make(map[*Client]bool)
-	broadcast  = make(chan Publish, 1024)
+	broadcast  = make(chan bt.Publish, 1024)
 	register   = make(chan *Client, 1024)
 	unregister = make(chan *Client, 1024)
 )
@@ -26,18 +30,37 @@ func Start() {
 	for {
 		select {
 		case pub := <-triggerSub:
-			trigger := pub.(app.Publication)
+			var (
+				trigger = pub.(app.TriggerPublication)
+				typ     = fmt.Sprintf("apps/%s", trigger.App)
 
-			typ := fmt.Sprintf("apps/%s", trigger.App)
+				policy   = bt.NewRequestPolicy("experiments/trigger", "create", trigger.Experiment)
+				resource = bt.NewResource(typ, trigger.Experiment, trigger.State)
+			)
 
-			policy := NewRequestPolicy("experiments/trigger", "create", trigger.Experiment)
-			resource := NewResource(typ, trigger.Experiment, trigger.State)
+			if trigger.Verb != "" {
+				policy.Verb = trigger.Verb
+			}
+
+			if trigger.Resource != "" {
+				resource.Name = trigger.Resource
+			}
 
 			if trigger.State == "error" {
-				result, _ := json.Marshal(map[string]interface{}{"error": trigger.Error.Error()})
-				broadcast <- Publish{RequestPolicy: policy, Resource: resource, Result: result}
+				var (
+					humanized *putil.HumanizedError
+					result    []byte
+				)
+
+				if errors.As(trigger.Error, &humanized) {
+					result, _ = json.Marshal(map[string]any{"error": humanized.Humanized()})
+				} else {
+					result, _ = json.Marshal(map[string]any{"error": trigger.Error.Error()})
+				}
+
+				broadcast <- bt.Publish{RequestPolicy: policy, Resource: resource, Result: result}
 			} else {
-				broadcast <- Publish{RequestPolicy: policy, Resource: resource, Result: nil}
+				broadcast <- bt.Publish{RequestPolicy: policy, Resource: resource, Result: nil}
 			}
 		case pub := <-delayedSub:
 			delayed := pub.(string)
@@ -58,10 +81,10 @@ func Start() {
 				continue
 			}
 
-			policy := NewRequestPolicy("vms/start", "update", strings.Join(names, "_"))
-			resource := NewResource("experiment/vm", delayed, "start")
+			policy := bt.NewRequestPolicy("vms/start", "update", strings.Join(names, "_"))
+			resource := bt.NewResource("experiment/vm", delayed, "start")
 
-			broadcast <- Publish{RequestPolicy: policy, Resource: resource, Result: body}
+			broadcast <- bt.Publish{RequestPolicy: policy, Resource: resource, Result: body}
 		case cli := <-register:
 			clients[cli] = true
 		case cli := <-unregister:
@@ -97,6 +120,6 @@ func Start() {
 	}
 }
 
-func Broadcast(policy *RequestPolicy, resource *Resource, msg json.RawMessage) {
-	broadcast <- Publish{RequestPolicy: policy, Resource: resource, Result: msg}
+func Broadcast(policy *bt.RequestPolicy, resource *bt.Resource, msg json.RawMessage) {
+	broadcast <- bt.Publish{RequestPolicy: policy, Resource: resource, Result: msg}
 }

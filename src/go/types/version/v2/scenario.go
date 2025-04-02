@@ -39,6 +39,16 @@ func (this *ScenarioSpec) App(name string) ifaces.ScenarioApp {
 	return nil
 }
 
+func (this *ScenarioSpec) AddApp(name string) ifaces.ScenarioApp {
+	a := &ScenarioApp{
+		NameF: name,
+	}
+
+	this.AppsF = append(this.AppsF, a)
+
+	return a
+}
+
 type ScenarioApp struct {
 	NameF            string             `json:"name" yaml:"name" structs:"name" mapstructure:"name"`
 	FromScenarioF    string             `json:"fromScenario,omitempty" yaml:"fromScenario,omitempty" structs:"fromScenario" mapstructure:"fromScenario"`
@@ -46,6 +56,7 @@ type ScenarioApp struct {
 	MetadataF        map[string]any     `json:"metadata,omitempty" yaml:"metadata,omitempty" structs:"metadata" mapstructure:"metadata"`
 	HostsF           []*ScenarioAppHost `json:"hosts,omitempty" yaml:"hosts,omitempty" structs:"hosts" mapstructure:"hosts"`
 	RunPeriodicallyF string             `json:"runPeriodically,omitempty" yaml:"runPeriodically,omitempty" structs:"runPeriodically" mapstructure:"runPeriodically"`
+	DisabledF        bool               `json:"disabled,omitempty" yaml:"disabled,omitempty" structs:"disabled" mapstructure:"disabled"`
 }
 
 func (this ScenarioApp) Name() string {
@@ -78,6 +89,10 @@ func (this ScenarioApp) RunPeriodically() string {
 	return this.RunPeriodicallyF
 }
 
+func (this ScenarioApp) Disabled() bool {
+	return this.DisabledF
+}
+
 func (this *ScenarioApp) SetAssetDir(dir string) {
 	this.AssetDirF = dir
 }
@@ -96,8 +111,22 @@ func (this *ScenarioApp) SetHosts(hosts []ifaces.ScenarioAppHost) {
 	this.HostsF = h
 }
 
+func (this *ScenarioApp) AddHost(hostname string) ifaces.ScenarioAppHost {
+	h := &ScenarioAppHost{
+		HostnameF: hostname,
+	}
+
+	this.HostsF = append(this.HostsF, h)
+
+	return h
+}
+
 func (this *ScenarioApp) SetRunPeriodically(d string) {
 	this.RunPeriodicallyF = d
+}
+
+func (this *ScenarioApp) SetDisabled(d bool) {
+	this.DisabledF = d
 }
 
 func (this ScenarioApp) ParseMetadata(md any) error {
@@ -137,6 +166,10 @@ func (this ScenarioAppHost) Hostname() string {
 
 func (this ScenarioAppHost) Metadata() map[string]any {
 	return this.MetadataF
+}
+
+func (this *ScenarioAppHost) SetMetadata(md map[string]interface{}) {
+	this.MetadataF = md
 }
 
 func (this ScenarioAppHost) ParseMetadata(md any) error {

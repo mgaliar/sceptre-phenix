@@ -7,14 +7,16 @@ import (
 	"os"
 	"strings"
 
+	"phenix/util/common"
+	"phenix/util/plog"
 	"phenix/web/broker"
+	"phenix/web/forward"
 	"phenix/web/middleware"
 	"phenix/web/rbac"
 	"phenix/web/scorch"
 	"phenix/web/util"
 	"phenix/web/weberror"
 
-	log "github.com/activeshadow/libminimega/minilog"
 	assetfs "github.com/elazarl/go-bindata-assetfs"
 	"github.com/gorilla/mux"
 )
@@ -41,7 +43,7 @@ func ConfigureUsers(users []string) error {
 
 			user.SetRole(role)
 		} else {
-			log.Error("getting %s role for user %s: %v", rname, user.Username(), err)
+			plog.Error("getting role for user", "user", user.Username(), "role", rname, "err", err)
 		}
 	}
 
@@ -55,7 +57,7 @@ func ConfigureUsers(users []string) error {
 		// Confirm existing user has specified role and update if necessary.
 		if user, err := rbac.GetUser(uname); err == nil {
 			if user.RoleName() != rname {
-				log.Debug("updating role for existing user %s from %s to %s", user.Username(), user.RoleName(), rname)
+				plog.Debug("updating role for existing user", "user", user.Username(), "old", user.RoleName(), "new", rname)
 
 				setUserRole(user, rname, creds[3:]...)
 			}
@@ -63,7 +65,7 @@ func ConfigureUsers(users []string) error {
 			continue
 		}
 
-		log.Debug("creating default user %s with role %s", uname, rname)
+		plog.Debug("creating default user", "user", uname, "role", rname)
 
 		user := rbac.NewUser(uname, pword)
 
@@ -85,7 +87,7 @@ func Start(opts ...ServerOption) error {
 
 	if o.unbundled {
 		assets = http.Dir("web/public")
-		log.Info("Serving unbundled assets")
+		plog.Info("serving unbundled assets")
 	} else {
 		assets = &assetfs.AssetFS{
 			Asset:     Asset,
@@ -94,12 +96,17 @@ func Start(opts ...ServerOption) error {
 		}
 	}
 
+	if o.featured("tunneler-download") {
+		plog.Info("Serving phēnix tunneler downloads")
+		router.HandleFunc("/downloads/tunneler/{name}", forward.GetTunneler).Methods("GET")
+	}
+
 	router.HandleFunc("/features", GetFeatures).Methods("GET")
 	router.HandleFunc("/version", GetVersion).Methods("GET")
 	router.HandleFunc("/builder", GetBuilder).Methods("GET")
 	router.HandleFunc("/builder/save", SaveBuilderTopology).Methods("POST")
 
-	log.Info("Setting up assets")
+	plog.Info("setting up assets")
 
 	router.PathPrefix("/docs/").Handler(
 		http.FileServer(assets),
@@ -153,6 +160,12 @@ func Start(opts ...ServerOption) error {
 	api.Handle("/experiments/{name}/apps", weberror.ErrorHandler(GetExperimentApps)).Methods("GET", "OPTIONS")
 	api.Handle("/experiments/{name}/start", weberror.ErrorHandler(StartExperiment)).Methods("POST", "OPTIONS")
 	api.Handle("/experiments/{name}/stop", weberror.ErrorHandler(StopExperiment)).Methods("POST", "OPTIONS")
+	api.HandleFunc("/experiments/{exp}/netflow", GetNetflow).Methods("GET", "OPTIONS")
+	api.HandleFunc("/experiments/{exp}/netflow", StartNetflow).Methods("POST", "OPTIONS")
+	api.HandleFunc("/experiments/{exp}/netflow", StopNetflow).Methods("DELETE", "OPTIONS")
+	api.HandleFunc("/experiments/{exp}/netflow/ws", GetNetflowWebSocket).Methods("GET", "OPTIONS")
+	api.HandleFunc("/experiments/{name}/topology", GetExperimentTopology).Methods("GET", "OPTIONS")
+	api.HandleFunc("/experiments/{name}/topology/search", SearchExperimentTopology).Methods("GET", "OPTIONS")
 	api.HandleFunc("/experiments/{name}/trigger", TriggerExperimentApps).Methods("POST", "OPTIONS")
 	api.HandleFunc("/experiments/{name}/trigger", CancelTriggeredExperimentApps).Methods("DELETE", "OPTIONS")
 	api.HandleFunc("/experiments/{name}/schedule", GetExperimentSchedule).Methods("GET", "OPTIONS")
@@ -184,6 +197,8 @@ func Start(opts ...ServerOption) error {
 	api.HandleFunc("/experiments/{exp}/vms/{name}/stop", StopVM).Methods("POST", "OPTIONS")
 	api.HandleFunc("/experiments/{exp}/vms/{name}/shutdown", ShutdownVM).Methods("GET", "OPTIONS")
 	api.HandleFunc("/experiments/{exp}/vms/{name}/redeploy", RedeployVM).Methods("POST", "OPTIONS")
+	api.HandleFunc("/experiments/{exp}/vms/{name}/cdrom", ChangeOpticalDisc).Methods("POST", "OPTIONS")
+	api.HandleFunc("/experiments/{exp}/vms/{name}/cdrom", EjectOpticalDisc).Methods("DELETE", "OPTIONS")
 	api.HandleFunc("/experiments/{exp}/vms/{name}/screenshot.png", GetScreenshot).Methods("GET", "OPTIONS")
 	api.HandleFunc("/experiments/{exp}/vms/{name}/vnc", GetVNC).Methods("GET", "OPTIONS")
 	api.HandleFunc("/experiments/{exp}/vms/{name}/vnc/ws", GetVNCWebSocket).Methods("GET", "OPTIONS")
@@ -195,6 +210,11 @@ func Start(opts ...ServerOption) error {
 	api.HandleFunc("/experiments/{exp}/vms/{name}/snapshots/{snapshot}", RestoreVM).Methods("POST", "OPTIONS")
 	api.HandleFunc("/experiments/{exp}/vms/{name}/commit", CommitVM).Methods("POST", "OPTIONS")
 	api.HandleFunc("/experiments/{exp}/vms/{name}/memorySnapshot", CreateVMMemorySnapshot).Methods("POST", "OPTIONS")
+
+	api.HandleFunc("/experiments/{exp}/vms/{name}/forwards", forward.GetPortForwards).Methods("GET", "OPTIONS")
+	api.HandleFunc("/experiments/{exp}/vms/{name}/forwards", forward.CreatePortForward).Methods("POST", "OPTIONS")
+	api.HandleFunc("/experiments/{exp}/vms/{name}/forwards", forward.DeletePortForward).Methods("DELETE", "OPTIONS")
+	api.HandleFunc("/experiments/{exp}/vms/{name}/forwards/{host}/{port}/ws", forward.GetPortForwardWebSocket).Methods("GET", "OPTIONS")
 
 	if o.featured("vm-mount") {
 		api.HandleFunc("/experiments/{exp}/vms/{name}/mount", MountVM).Methods("POST", "OPTIONS")
@@ -210,7 +230,6 @@ func Start(opts ...ServerOption) error {
 	api.HandleFunc("/topologies/{topo}/scenarios", GetScenarios).Methods("GET", "OPTIONS")
 	api.HandleFunc("/disks", GetDisks).Methods("GET", "OPTIONS")
 	api.HandleFunc("/hosts", GetClusterHosts).Methods("GET", "OPTIONS")
-	api.HandleFunc("/logs", GetLogs).Methods("GET", "OPTIONS")
 	api.HandleFunc("/users", GetUsers).Methods("GET", "OPTIONS")
 	api.HandleFunc("/users", CreateUser).Methods("POST", "OPTIONS")
 	api.HandleFunc("/users/{username}", GetUser).Methods("GET", "OPTIONS")
@@ -236,41 +255,46 @@ func Start(opts ...ServerOption) error {
 		{"/errors/{uuid}", weberror.ErrorHandler(GetError), []string{"GET"}},
 	}
 
+	optionRoutes := []route{
+		{"/options", weberror.ErrorHandler(GetOptions), []string{"GET"}},
+	}
+
 	addRoutesToRouter(api, workflowRoutes...)
 	addRoutesToRouter(api, errorRoutes...)
+	addRoutesToRouter(api, optionRoutes...)
 
 	if o.allowCORS {
-		log.Info("CORS is enabled on HTTP API endpoints")
+		plog.Info("CORS is enabled on HTTP API endpoints")
 		api.Use(middleware.AllowCORS)
 	}
 
 	switch o.logMiddleware {
 	case "full":
-		log.Info("full HTTP logging is enabled")
+		plog.Info("full HTTP logging is enabled")
 		api.Use(middleware.LogFull)
 	case "requests":
-		log.Info("requests-only HTTP logging is enabled")
+		plog.Info("requests-only HTTP logging is enabled")
 		api.Use(middleware.LogRequests)
 	}
 
 	api.Use(middleware.Auth(o.jwtKey, o.proxyAuthHeader))
 
-	log.Info("Starting websockets broker")
+	plog.Info("starting websockets broker")
 
 	go broker.Start()
 
-	log.Info("Starting scorch processors")
+	plog.Info("starting scorch processors")
 
 	go scorch.Start(o.basePath)
 
-	log.Info("Starting log publisher")
+	plog.Info("starting log publisher")
 
-	go PublishLogs(context.Background(), o.phenixLogs, o.minimegaLogs)
+	go PublishMinimegaLogs(context.Background(), o.minimegaLogs)
 
-	log.Info("Using base path '%s'", o.basePath)
-	log.Info("Using JWT lifetime of %v", o.jwtLifetime)
+	plog.Info("using base path", "path", o.basePath)
+	plog.Info("using JWT lifetime", "lifetime", o.jwtLifetime)
 
-	if o.unixSocket != "" {
+	if common.UnixSocket != "" {
 		var (
 			router = mux.NewRouter().StrictSlash(true)
 			api    = router.PathPrefix("/api/v1").Subrouter()
@@ -278,31 +302,42 @@ func Start(opts ...ServerOption) error {
 
 		addRoutesToRouter(api, workflowRoutes...)
 		addRoutesToRouter(api, errorRoutes...)
+		addRoutesToRouter(api, optionRoutes...)
 
 		api.Use(middleware.NoAuth)
 
-		os.Remove(o.unixSocket)
+		os.Remove(common.UnixSocket)
 
-		log.Info("Starting Unix socket server at '%s'", o.unixSocket)
+		plog.Info("starting Unix socket server", "path", common.UnixSocket)
 
 		server := http.Server{Handler: router}
-		listener, err := net.Listen("unix", o.unixSocket)
+		listener, err := net.Listen("unix", common.UnixSocket)
 		if err != nil {
 			return err
 		}
 
+		if o.unixSocketGid != -1 {
+			plog.Info("setting Unix socket group permissions", "gid", o.unixSocketGid)
+			if err = os.Chown(common.UnixSocket, -1, o.unixSocketGid); err != nil {
+				return err
+			}
+			if err := os.Chmod(common.UnixSocket, 0775); err != nil {
+				return err
+			}
+		}
+
 		go func() {
 			if err := server.Serve(listener); err != nil {
-				log.Error("serving Unix socket: %v", err)
+				plog.Error("serving Unix socket", "err", err)
 			}
 		}()
 	}
 
 	if o.tlsEnabled() {
-		log.Info("Starting HTTPS server on %s", o.endpoint)
+		plog.Info("starting HTTPS server", "endpoint", o.endpoint)
 		return http.ListenAndServeTLS(o.endpoint, o.tlsCrtPath, o.tlsKeyPath, router)
 	} else {
-		log.Info("Starting HTTP server on %s", o.endpoint)
+		plog.Info("Starting HTTP server", "endpoint", o.endpoint)
 		return http.ListenAndServe(o.endpoint, router)
 	}
 }

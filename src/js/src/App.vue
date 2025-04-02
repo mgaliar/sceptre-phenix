@@ -44,6 +44,15 @@ login and returns a user to Experiments component if successful.
         console.log(`ERROR getting features: ${err}`);
       }
 
+      try {
+        let resp    = await fetch(this.$router.resolve({ name: 'options'}).href);
+        let options = await resp.json();
+
+        this.$store.commit( 'OPTIONS', options );
+      } catch (err) {
+        console.log(`ERROR getting options: ${err}`);
+      }
+
       this.wsConnect();
 
       this.unwatch = this.$store.watch(
@@ -101,6 +110,10 @@ login and returns a user to Experiments component if successful.
                 type:    'is-success',
                 duration: 5000
               });
+            }
+
+            if ( msg.resource.type == 'log' ) {
+              this.$store.commit( 'LOG', msg.result );
             }
           }
         });

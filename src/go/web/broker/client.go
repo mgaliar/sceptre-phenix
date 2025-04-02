@@ -6,19 +6,24 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"phenix/api/experiment"
 	"phenix/api/vm"
+	"phenix/util/cache"
 	"phenix/util/mm"
+	"phenix/util/plog"
 	"phenix/web/proto"
 	"phenix/web/rbac"
 	"phenix/web/util"
 
-	log "github.com/activeshadow/libminimega/minilog"
+	bt "phenix/web/broker/brokertypes"
+
 	"github.com/gorilla/websocket"
 	"google.golang.org/protobuf/encoding/protojson"
+	"inet.af/netaddr"
 )
 
 var marshaler = protojson.MarshalOptions{EmitUnpopulated: true}
@@ -88,7 +93,7 @@ func (this *Client) stop() {
 	defer this.connMu.Unlock()
 
 	if err := this.conn.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
-		log.Warn("closing client connection: %v", err)
+		plog.Warn("closing client connection", "err", err)
 	}
 
 	this.conn.Close()
@@ -100,13 +105,13 @@ func (this *Client) read() {
 	this.conn.SetReadLimit(maxMsgSize)
 
 	if err := this.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
-		log.Error("setting read deadline for client connection: %v", err)
+		plog.Error("setting read deadline for client connection", "err", err)
 		return
 	}
 
 	ponger := func(string) error {
 		if err := this.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
-			log.Error("setting read deadline in pong handler for client connection: %v", err)
+			plog.Error("setting read deadline in pong handler for client connection", "err", err)
 			return err
 		}
 
@@ -123,40 +128,141 @@ func (this *Client) read() {
 			_, msg, err := this.conn.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Debug("reading from WebSocket client: %v", err)
+					plog.Debug("reading from WebSocket client", "err", err)
 				}
 
 				return
 			}
 
-			var req Request
+			var req bt.Request
 			if err := json.Unmarshal(msg, &req); err != nil {
-				log.Error("cannot unmarshal request JSON: %v", err)
+				plog.Error("cannot unmarshal request JSON", "err", err)
 				continue
 			}
 
 			switch req.Resource.Type {
 			case "experiment/vms":
+			case "experiment/topology":
+				// TODO: check RBAC permissions?
+
+				switch req.Resource.Action {
+				case "search":
+					var query map[string]string
+
+					if err := json.Unmarshal(req.Payload, &query); err != nil {
+						plog.Error("cannot unmarshal request payload", "err", err)
+						continue
+					}
+
+					// TODO: handle multiple query terms (how? AND or OR?)
+					// Do the same as in web/experiment.go@SearchExperimentTopology
+					term := query["term"]
+					if term == "" {
+						term = "hostname"
+					}
+
+					value := query["value"]
+					if value == "" {
+						plog.Error("missing search value for term", "term", term)
+						continue
+					}
+
+					cacheKey := fmt.Sprintf("experiment|%s|search", req.Resource.Name)
+
+					val, ok := cache.Get(cacheKey)
+					if !ok {
+						// warm the cache (again?)
+						if _, err := vm.Topology(req.Resource.Name, nil); err != nil {
+							plog.Error("getting experiment topology", "exp", req.Resource.Name, "err", err)
+							continue
+						}
+
+						val, _ = cache.Get(cacheKey)
+					}
+
+					var (
+						search = val.(vm.TopologySearch)
+						nodes  []int
+					)
+
+					switch strings.ToLower(term) {
+					case "hostname":
+						if node, ok := search.Hostname[value]; ok {
+							nodes = []int{node}
+						}
+					case "disk":
+						nodes = search.Disk[value]
+					case "node-type":
+						nodes = search.Type[value]
+					case "os-type":
+						nodes = search.OSType[value]
+					case "label":
+						nodes = search.Label[value]
+					case "annotation":
+						nodes = search.Annotation[value]
+					case "vlan":
+						nodes = search.VLAN[value]
+					case "ip":
+						if net, err := netaddr.ParseIPPrefix(value); err == nil {
+							for k, v := range search.IP {
+								ip, err := netaddr.ParseIP(k)
+								if err != nil {
+									continue
+								}
+
+								if net.Contains(ip) {
+									nodes = append(nodes, v...)
+								}
+							}
+						} else {
+							nodes = search.IP[value]
+						}
+					}
+
+					results := map[string]any{
+						"term":  term,
+						"value": value,
+						"results": map[string]any{
+							"nodes": nodes,
+						},
+					}
+
+					body, err := json.Marshal(results)
+					if err != nil {
+						plog.Error("marshaling search results for WebSocket client", "err", err)
+						continue
+					}
+
+					this.publish <- bt.Publish{
+						Resource: bt.NewResource("experiment/topology", req.Resource.Name, "search"),
+						Result:   body,
+					}
+
+					continue
+				default:
+					plog.Error("unexpected WebSocket request resource action for experiment/topology resource type", "action", req.Resource.Action)
+					continue
+				}
 			default:
-				log.Error("unexpected WebSocket request resource type: %s", req.Resource.Type)
+				plog.Error("unexpected WebSocket request resource type", "type", req.Resource.Type)
 				continue
 			}
 
 			switch req.Resource.Action {
 			case "list":
 			default:
-				log.Error("unexpected WebSocket request resource action: %s", req.Resource.Action)
+				plog.Error("unexpected WebSocket request resource action", "action", req.Resource.Action)
 				continue
 			}
 
 			var payload map[string]interface{}
 			if err := json.Unmarshal(req.Payload, &payload); err != nil {
-				log.Error("cannot unmarshal WebSocket request payload JSON: %v", err)
+				plog.Error("cannot unmarshal WebSocket request payload JSON", "err", err)
 				continue
 			}
 
 			if !this.role.Allowed("vms", "list") {
-				log.Warn("client access to vms/list forbidden")
+				plog.Warn("client access to vms/list forbidden")
 				continue
 			}
 
@@ -164,13 +270,13 @@ func (this *Client) read() {
 
 			exp, err := experiment.Get(expName)
 			if err != nil {
-				log.Error("getting experiment %s for WebSocket client: %v", expName, err)
+				plog.Error("getting experiment for WebSocket client", "exp", expName, "err", err)
 				continue
 			}
 
 			vms, err := vm.List(expName)
 			if err != nil {
-				log.Error("getting list of VMs for experiment %s: %v", expName, err)
+				plog.Error("getting list of VMs for experiment", "exp", expName, "err", err)
 				continue
 			}
 
@@ -210,7 +316,7 @@ func (this *Client) read() {
 					if vm.Running {
 						screenshot, err := util.GetScreenshot(expName, vm.Name, "200")
 						if err != nil {
-							log.Error("getting screenshot for WebSocket client: %v", err)
+							plog.Error("getting screenshot for WebSocket client", "err", err)
 						} else {
 							vm.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 						}
@@ -256,12 +362,12 @@ func (this *Client) read() {
 
 			body, err := marshaler.Marshal(resp)
 			if err != nil {
-				log.Error("marshaling experiment %s VMs for WebSocket client: %v", exp, err)
+				plog.Error("marshaling experiment VMs for WebSocket client", "exp", exp, "err", err)
 				continue
 			}
 
-			this.publish <- Publish{
-				Resource: NewResource("experiment/vms", expName, "list"),
+			this.publish <- bt.Publish{
+				Resource: bt.NewResource("experiment/vms", expName, "list"),
 				Result:   body,
 			}
 		}
@@ -280,16 +386,16 @@ func (this *Client) write() {
 			return
 		case msg := <-this.publish:
 			if err := this.publisher(msg); err != nil {
-				log.Error("publishing message to client: %v", err)
+				plog.Error("publishing message to client", "err", err)
 			}
 		case <-ticker.C:
 			if err := this.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
-				log.Error("setting write deadline for client connection: %v", err)
+				plog.Error("setting write deadline for client connection", "err", err)
 				return
 			}
 
 			if err := this.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Error("pinging client connection: %v", err)
+				plog.Error("pinging client connection", "err", err)
 				return
 			}
 		}
@@ -313,7 +419,7 @@ func (this *Client) publisher(msg interface{}) error {
 
 	b, err := json.Marshal(msg)
 	if err != nil {
-		log.Error("marshaling message to be published: %v", err)
+		plog.Error("marshaling message to be published", "err", err)
 		return nil
 	}
 
@@ -330,7 +436,7 @@ func (this *Client) publisher(msg interface{}) error {
 
 		b, err := json.Marshal(msg)
 		if err != nil {
-			log.Error("marshaling message to be published: %v", err)
+			plog.Error("marshaling message to be published", "err", err)
 			continue
 		}
 
@@ -375,19 +481,19 @@ func (this *Client) screenshots() {
 							continue
 						}
 
-						log.Error("getting screenshot for WebSocket client: %v", err)
+						plog.Error("getting screenshot for WebSocket client", "err", err)
 						continue
 					}
 
 					encoded := "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 					marshalled, err := json.Marshal(util.WithRoot("screenshot", encoded))
 					if err != nil {
-						log.Error("marshaling VM %s screenshot for WebSocket client: %v", vm, err)
+						plog.Error("marshaling VM screenshot for WebSocket client", "vm", vm, "err", err)
 						continue
 					}
 
-					this.publish <- Publish{
-						Resource: NewResource("experiment/vm/screenshot", fmt.Sprintf("%s/%s", exp, vm), "update"),
+					this.publish <- bt.Publish{
+						Resource: bt.NewResource("experiment/vm/screenshot", fmt.Sprintf("%s/%s", exp, vm), "update"),
 						Result:   marshalled,
 					}
 				}
@@ -401,7 +507,7 @@ func ServeWS(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Error("upgrading connection to WebSocket: %v", err)
+		plog.Error("upgrading connection to WebSocket", "err", err)
 		return
 	}
 

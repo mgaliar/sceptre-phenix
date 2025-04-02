@@ -82,7 +82,9 @@ func SetDefaults(img *v1.Image) error {
 
 	img.Scripts = make(map[string]string)
 
-	img.Packages = append(img.Packages, PACKAGES_DEFAULT...)
+	if !img.SkipDefaultPackages {
+		img.Packages = append(img.Packages, PACKAGES_DEFAULT...)
+	}
 
 	switch img.Variant {
 	case "minbase":
@@ -178,10 +180,6 @@ func CreateFromConfig(name, saveas string, overlays, packages, scripts []string)
 
 	if err := mapstructure.Decode(c.Spec, &img); err != nil {
 		return fmt.Errorf("decoding image spec: %w", err)
-	}
-
-	if err := SetDefaults(&img); err != nil {
-		return fmt.Errorf("setting image defaults: %w", err)
 	}
 
 	c.Metadata.Name = saveas

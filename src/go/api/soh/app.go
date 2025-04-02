@@ -14,9 +14,9 @@ import (
 	"phenix/types"
 	ifaces "phenix/types/interfaces"
 	"phenix/util/mm"
+	"phenix/util/plog"
 
 	"github.com/activeshadow/structs"
-	"github.com/fatih/color"
 	"github.com/olivere/elastic/v7"
 )
 
@@ -97,7 +97,7 @@ func (this *SOH) Configure(ctx context.Context, exp *types.Experiment) error {
 				return fmt.Errorf("building Elastic server node: %w", err)
 			}
 
-			exp.Spec.Topology().Init()
+			exp.Spec.Topology().Init(exp.Spec.DefaultBridge())
 		}
 	}
 
@@ -168,14 +168,48 @@ func (SOH) Cleanup(ctx context.Context, exp *types.Experiment) error {
 }
 
 func (this *SOH) runChecks(ctx context.Context, exp *types.Experiment) error {
-	printer := color.New(color.FgBlue)
+	logger := plog.LoggerFromContext(ctx)
 
-	printer.Println("  Starting SoH checks...")
+	logger.Info("starting SOH checks")
 
 	// *** WAIT FOR NODES TO HAVE NETWORKING CONFIGURED *** //
 
+	md := app.GetContextMetadata(ctx)
 	ns := exp.Spec.ExperimentName()
 	wg := new(mm.StateGroup)
+
+	if val, ok := md["c2Timeout"]; ok {
+		if duration, ok := val.(string); ok {
+			if timeout, err := time.ParseDuration(duration); err == nil {
+				this.md.c2Timeout = timeout
+			}
+		}
+	}
+
+	var checks map[string]bool
+
+	if val, ok := md["checks"]; ok {
+		if slice, ok := val.([]string); ok {
+			checks = make(map[string]bool)
+
+			for _, check := range slice {
+				checks[check] = true
+			}
+		}
+	}
+
+	if checks == nil { // default to all checks
+		checks = map[string]bool{
+			"network-config":      true,
+			"reachability":        true,
+			"custom-reachability": true,
+			"processes":           true,
+			"ports":               true,
+			"custom":              true,
+			"cpu-load":            true,
+			"flows":               true,
+		}
+	}
 
 	for _, node := range exp.Spec.Topology().Nodes() {
 		if node.External() {
@@ -193,7 +227,7 @@ func (this *SOH) runChecks(ctx context.Context, exp *types.Experiment) error {
 		this.nodes[host] = node
 
 		if skip(node, this.md.SkipHosts) {
-			printer.Printf("  Skipping host %s per config\n", host)
+			logger.Debug("skipping host per config", "host", host)
 			continue
 		}
 
@@ -201,7 +235,7 @@ func (this *SOH) runChecks(ctx context.Context, exp *types.Experiment) error {
 		// mapping the first time C2 is proven to not be working.
 		this.c2Hosts[host] = struct{}{}
 
-		if this.md.SkipNetworkConfig {
+		if this.md.SkipNetworkConfig || !checks["network-config"] {
 			continue
 		}
 
@@ -222,7 +256,7 @@ func (this *SOH) runChecks(ctx context.Context, exp *types.Experiment) error {
 				go func(idx int, iface ifaces.NodeNetworkInterface) { // using an anonymous function here so we can break out of the inner select statement
 					defer wg.Done()
 
-					printer.Printf("  Waiting for DHCP address on %s\n", host)
+					logger.Debug("waiting for DHCP address", "host", host)
 
 					timer := time.After(this.md.c2Timeout)
 
@@ -273,15 +307,14 @@ func (this *SOH) runChecks(ctx context.Context, exp *types.Experiment) error {
 			this.gatherNodeIPs(node)
 
 			cidr := fmt.Sprintf("%s/%d", iface.Address(), iface.Mask())
-			printer.Printf("  Waiting for IP %s on host %s to be set...\n", cidr, host)
+			logger.Debug("waiting for IP on host to be set", "host", host, "ip", cidr)
 
 			this.isNetworkingConfigured(ctx, wg, ns, node, iface)
 		}
 	}
 
-	if this.md.SkipNetworkConfig {
-		printer = color.New(color.FgYellow)
-		printer.Println("  Skipping initial network configuration tests per config")
+	if this.md.SkipNetworkConfig || !checks["network-config"] {
+		logger.Info("skipping initial network configuration tests per config")
 	}
 
 	cancel := periodicallyNotify(ctx, "waiting for initial network configurations to be validated...", 5*time.Second)
@@ -295,8 +328,6 @@ func (this *SOH) runChecks(ctx context.Context, exp *types.Experiment) error {
 		return ctx.Err()
 	}
 
-	printer = color.New(color.FgRed)
-
 	for _, state := range wg.States {
 		host := state.Meta["host"].(string)
 
@@ -306,7 +337,7 @@ func (this *SOH) runChecks(ctx context.Context, exp *types.Experiment) error {
 		}
 
 		if err := state.Err; err != nil {
-			printer.Printf("  [✗] failed to confirm networking on %s: %v\n", host, err)
+			logger.Error("[✗] failed to confirm networking", "host", host, "err", err)
 
 			if errors.Is(err, mm.ErrC2ClientNotActive) {
 				delete(this.c2Hosts, host)
@@ -334,50 +365,75 @@ func (this *SOH) runChecks(ctx context.Context, exp *types.Experiment) error {
 
 	// *** RUN ACTUAL STATE OF HEALTH CHECKS *** //
 
-	this.waitForReachabilityTest(ctx, ns)
-	this.writeResults(exp)
+	var errs bool
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if checks["network-config"] && (checks["reachability"] || checks["custom-reachability"]) {
+		err := this.waitForReachabilityTest(ctx, ns, checks)
+		this.writeResults(exp)
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		errs = errs || err
 	}
 
-	this.waitForProcTest(ctx, ns)
-	this.writeResults(exp)
+	if checks["processes"] {
+		err := this.waitForProcTest(ctx, ns)
+		this.writeResults(exp)
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		errs = errs || err
 	}
 
-	this.waitForPortTest(ctx, ns)
-	this.writeResults(exp)
+	if checks["ports"] {
+		err := this.waitForPortTest(ctx, ns)
+		this.writeResults(exp)
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		errs = errs || err
 	}
 
-	this.waitForCustomTest(ctx, ns)
-	this.writeResults(exp)
+	if checks["custom"] {
+		err := this.waitForCustomTest(ctx, ns)
+		this.writeResults(exp)
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		errs = errs || err
 	}
 
-	this.waitForCPULoad(ctx, ns)
-	this.writeResults(exp)
+	if checks["cpu-load"] {
+		err := this.waitForCPULoad(ctx, ns)
+		this.writeResults(exp)
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		errs = errs || err
 	}
 
-	this.getFlows(ctx, exp)
-	this.writeResults(exp)
+	if checks["flows"] {
+		this.getFlows(ctx, exp)
+		this.writeResults(exp)
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 	}
 
-	// TODO: this does not include errors from above function calls
-	if wg.ErrCount > 0 {
+	this.writeInitialized(exp)
+
+	if errs || wg.ErrCount > 0 {
 		return fmt.Errorf("errors encountered in state of health app")
 	}
 
@@ -523,22 +579,35 @@ func (this *SOH) gatherNodeIPs(node ifaces.NodeSpec) {
 }
 
 func (this SOH) writeResults(exp *types.Experiment) {
-	appStatus := make(map[string]interface{})
+	// we do this to make sure we don't overwrite the `initialized` status
+	status := make(map[string]any)
+	exp.Status.ParseAppStatus("soh", &status)
 
 	if len(this.status) > 0 {
-		var states []map[string]interface{}
+		var states []map[string]any
 
 		for _, state := range this.status {
 			states = append(states, structs.Map(state))
 		}
 
-		appStatus["hosts"] = states
+		status["hosts"] = states
 	}
 
 	if len(this.packetCapture) > 0 {
-		appStatus["packetCapture"] = this.packetCapture
+		status["packetCapture"] = this.packetCapture
 	}
 
-	exp.Status.SetAppStatus("soh", appStatus)
+	exp.Status.SetAppStatus("soh", status)
+	exp.WriteToStore(true)
+}
+
+func (this SOH) writeInitialized(exp *types.Experiment) {
+	// we do this to make sure we don't overwrite the existing app status
+	status := make(map[string]any)
+	exp.Status.ParseAppStatus("soh", &status)
+
+	status["initialized"] = true
+
+	exp.Status.SetAppStatus("soh", status)
 	exp.WriteToStore(true)
 }

@@ -179,9 +179,28 @@ func (this User) UpdatePassword(old, new string) error {
 	return nil
 }
 
+func (this User) GetProxyToken() string {
+	for token, note := range this.Spec.Tokens {
+		if note == "proxied" {
+			return token
+		}
+	}
+
+	return ""
+}
+
 func (this User) AddToken(token, note string) error {
 	if this.Spec.Tokens == nil {
 		this.Spec.Tokens = make(map[string]string)
+	}
+
+	if note == "proxied" {
+		// we only want to keep one proxy JWT
+		for k, v := range this.Spec.Tokens {
+			if v == "proxied" {
+				delete(this.Spec.Tokens, k)
+			}
+		}
 	}
 
 	enc := base64.StdEncoding.EncodeToString([]byte(token))
@@ -211,12 +230,10 @@ func (this User) DeleteToken(token string) error {
 }
 
 func (this User) ValidateToken(token string) error {
-	for enc := range this.Spec.Tokens {
-		t, _ := base64.StdEncoding.DecodeString(enc)
+	enc := base64.StdEncoding.EncodeToString([]byte(token))
 
-		if token == string(t) {
-			return nil
-		}
+	if _, ok := this.Spec.Tokens[enc]; ok {
+		return nil
 	}
 
 	return fmt.Errorf("token not found for user")

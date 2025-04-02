@@ -15,6 +15,7 @@ import StateOfHealth from './components/StateOfHealth.vue'
 import Users         from './components/Users.vue'
 import VMtiles       from './components/VMtiles.vue'
 import MiniConsole   from './components/MiniConsole.vue'
+import Tunneler      from './components/Tunneler.vue'
 
 import store from './store'
 
@@ -24,7 +25,18 @@ const router = new Router({
   mode: 'history',
   base: process.env.BASE_URL,
   routes: [
-    {path: '/',                  name: 'home',        redirect:  {name: 'experiments'}},
+    {
+      path: '/',
+      name: 'home',
+      redirect: () => {
+        if (store.getters.auth && store.getters.role.name === "VM Viewer") {
+          return {'name': 'vmtiles'}
+        }
+
+        return {name: 'experiments'}
+      }
+    },
+
     {path: '/configs',           name: 'configs',     component: Configs},
     {path: '/disabled',          name: 'disabled',    component: Disabled},
     {path: '/experiments',       name: 'experiments', component: Experiments},
@@ -38,16 +50,23 @@ const router = new Router({
     {path: '/users',             name: 'users',       component: Users},
     {path: '/vmtiles',           name: 'vmtiles',     component: VMtiles},
     {path: '/console',           name: 'console',     component: MiniConsole},
+    {path: '/tunneler',          name: 'tunneler',    component: Tunneler},
 
     {path: '/builder?token=:token', name: 'builder'},
     {path: '/version',              name: 'version'},
     {path: '/features',             name: 'features'},
+    {path: '/api/v1/options',       name: 'options'},
 
     {path: '/api/v1/console/:pid/ws',   name: 'console-ws'},
     {path: '/api/v1/console/:pid/size', name: 'console-size'},
 
     {path: '/api/v1/experiments/:id/files/:name\\?path=:path&token=:token', name: 'file'},
     {path: '/api/v1/experiments/:id/vms/:name/vnc?token=:token',            name: 'vnc'},
+
+    {path: '/downloads/tunneler/phenix-tunneler-linux-amd64',       name: 'linux-tunneler'},
+    {path: '/downloads/tunneler/phenix-tunneler-darwin-arm64',      name: 'macos-arm-tunneler'},
+    {path: '/downloads/tunneler/phenix-tunneler-darwin-amd64',      name: 'macos-intel-tunneler'},
+    {path: '/downloads/tunneler/phenix-tunneler-windows-amd64.exe', name: 'windows-tunneler'},
 
     {path: '/proxysignup', name: 'proxysignup', component: ProxySignUp, props: true},
 
@@ -58,7 +77,7 @@ const router = new Router({
 router.beforeEach( async ( to, from, next ) => {
   if ( process.env.VUE_APP_AUTH === 'disabled' ) {
     if ( !store.getters.auth ) {
-      let globalAdmin = {
+      let role = {
         name: "Global Admin",
         policies: [{
           "resources": ["*", "*/*"],
@@ -67,41 +86,47 @@ router.beforeEach( async ( to, from, next ) => {
         }]
       }
 
-      store.commit( 'LOGIN', { 'loginResponse': { 'token': 'authorized', 'user': {'role': globalAdmin}}, 'remember': false } )
+      let loginResponse = {
+        'token': 'authorized',
+        'user': {
+          'username': 'global-admin',
+          role,
+        }
+      }
+
+      store.commit( 'LOGIN', { loginResponse, 'remember': false } );
     }
 
-    next()
-    return
+    next();
+    return;
   }
 
   if ( to.name === 'disabled' ) {
-    next()
-    return
+    next();
+    return;
   }
 
   if ( to.name === 'signin' && process.env.VUE_APP_AUTH === 'enabled' ) {
-    next()
-    return
+    next();
+    return;
   }
 
   if ( to.name === 'proxysignup' && process.env.VUE_APP_AUTH === 'proxy' ) {
-    next()
-    return
+    next();
+    return;
   }
 
   if ( store.getters.auth ) {
-    if ( store.getters.role === 'Disabled' ) {
-      router.replace( '/disabled' );
+    if ( store.getters.role.name === 'Disabled' ) {
+      router.replace('/disabled');
+    } else if ( to.name === 'signin' ) {
+      // No need to go to the signin route if already authorized.
+      router.replace('/');
+    } else {
+      next();
     }
-
-    // No need to go to the signin route if already authorized.
-    if ( to.name === 'signin' ) {
-      router.replace( '/' );
-    }
-
-    next()
   } else {
-    store.commit( 'NEXT', to )
+    store.commit( 'NEXT', to );
 
     if ( process.env.VUE_APP_AUTH === 'proxy' ) {
       try {
@@ -117,7 +142,7 @@ router.beforeEach( async ( to, from, next ) => {
         }
       }
     } else {
-      next( {name: 'signin'} )
+      next( {name: 'signin'} );
     }
   }
 })

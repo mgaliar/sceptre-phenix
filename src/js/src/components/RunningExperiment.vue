@@ -1,7 +1,7 @@
 <template>
   <div class="content">
     <b-modal :active.sync="expModal.active" :on-cancel="resetExpModal" has-modal-card>
-      <div class="modal-card" style="width:30em">
+      <div class="modal-card" style="width:35em">
         <header class="modal-card-head">
           <p class="modal-card-title">{{ expModal.vm.name ? expModal.vm.name : "unknown" }}</p>
         </header>
@@ -12,7 +12,7 @@
           <p>Memory: {{ expModal.vm.ram | ram }}</p>
           <p>Disk: {{ expModal.vm.disk }}</p>
           <p>Uptime: {{ expModal.vm.uptime | uptime }}</p>
-          <p>Delay: {{ expModal.vm.delayed_start }}</p>
+          <p v-if="expModal.vm.delayed_start">Delay: {{ expModal.vm.delayed_start }}</p>
           <p>Network(s): {{ expModal.vm.networks | stringify | lowercase }}</p>
           <p>Taps: {{ expModal.vm.taps | stringify | lowercase }}</p>
           <p>CC Active: {{ expModal.vm.ccActive }}</p>
@@ -21,11 +21,21 @@
             <br>
             <p v-for="( snap, index ) in expModal.snapshots" :key="index">
               <b-tooltip label="restore this snapshot" type="is-light is-right">
-                <b-icon icon="play-circle"  style="color:#686868" @click.native="restoreSnapshot( expModal.vm.name, snap )"></b-icon>
+                <b-icon icon="play-circle" style="color:#686868" @click.native="restoreSnapshot( expModal.vm.name, snap )"></b-icon>
               </b-tooltip>
               {{ snap }}
             </p>
           </p>          
+          <p v-if="expModal.forwards.length !== 0">
+            Port Forwards:
+            <br>
+            <p v-for="( forward, index ) in expModal.forwards" :key="index">
+              {{ forward.desc }} ({{ forward.owner }})
+              <b-tooltip v-if="forward.canDelete" label="delete this port forward" type="is-light is-right">
+                <b-icon icon="trash" size="is-small" style="color:#686868" @click.native="deletePortForward(expModal.vm.name, forward)"></b-icon>
+              </b-tooltip>
+            </p>
+          </p>
       </section>
       <footer class="modal-card-foot buttons is-right">
         <div v-if="roleAllowed('vms/start', 'update', expModal.fullName) && !showModifyStateBar">
@@ -46,6 +56,13 @@
           &nbsp;
           <b-tooltip :label="!expModal.vm.ccActive ? 'mount vm (requires active cc)' : 'mount vm'" type="is-light">
             <b-button class="button is-light" icon-left="hdd" @click="showMountDialog(expModal.vm.name)" :disabled="!expModal.vm.ccActive">
+            </b-button>
+          </b-tooltip>
+        </div>
+        <div v-if="roleAllowed('vms/forwards', 'create', expModal.fullName) && !showModifyStateBar && expModal.vm.running">
+          &nbsp;
+          <b-tooltip label="create port forward" type="is-light">
+            <b-button class="button is-light" icon-left="arrow-right" @click="showPortForwardDialog(expModal.vm.name)" :disabled="!expModal.vm.ccActive">
             </b-button>
           </b-tooltip>
         </div>
@@ -70,10 +87,11 @@
             </b-button>
           </b-tooltip>
         </div>
-        <div v-if="roleAllowed('vms/screenshot', 'get', expModal.fullName) && !showModifyStateBar && expModal.vm.running">
+        <div v-if="roleAllowed('vms/cdrom', 'update', expModal.fullName) && roleAllowed('vms/cdrom', 'delete', expModal.fullName)
+         && !showModifyStateBar && expModal.vm.running">
           &nbsp;
-          <b-tooltip label="record screenshot" type="is-light">
-            <b-button class="button is-light" icon-left="video" @click="notImplemented()">
+          <b-tooltip :label="getOpticalDiscLabel()" type="is-light">
+            <b-button class="button is-light" icon-left="compact-disc" @click="showChangeDisc(expModal.vm)">
             </b-button>
           </b-tooltip>
         </div>
@@ -121,6 +139,27 @@
             </b-button>
           </b-tooltip>
         </div>
+      </footer>
+    </div>
+  </b-modal>
+  <b-modal :active.sync="portForwardModal.active" :on-cancel="resetPortForwardModal" has-modal-card>
+    <div class="modal-card" style="width:30em">
+      <header class="modal-card-head">
+        <p class="modal-card-title">Create New Port Forward</p>
+      </header>
+      <section class="modal-card-body">
+        <b-field label="Source Port">
+          <b-input type="text" v-model="portForwardModal.srcPort"></b-input>
+        </b-field>
+        <b-field label="Destination Host">
+          <b-input type="text" v-model="portForwardModal.dstHost"></b-input>
+        </b-field>
+        <b-field label="Destination Port">
+          <b-input type="text" v-model="portForwardModal.dstPort"></b-input>
+        </b-field>
+      </section>
+      <footer class="modal-card-foot buttons is-right">
+        <button class="button is-success" @click="createPortForward()">Create</button>
       </footer>
     </div>
   </b-modal>
@@ -336,6 +375,38 @@
         </footer>
       </div>
     </b-modal>
+    <b-modal :active.sync="opticalDiscModal.active" has-modal-card :on-cancel="resetOpticalDiscModal" ref="opticalDisc">
+      <div align="left" class="modal-card" style="width:auto">
+        <header class="modal-card-head">
+          <p  class="modal-card-title">Change Optical Disc for {{opticalDiscModal.vmName}} </p>
+        </header>
+        <section class="modal-card-body pt-3">   
+              <font color="#202020">             
+              <b-field label="Optical Disc:">
+              <b-tooltip :label="getDiskToolTip(opticalDiscModal.disc, 'select ISO')" type="is-dark">
+              <b-select :value="opticalDiscModal.disc" @input="( value ) =>  opticalDiscModal.disc = value">
+                <option
+                  v-for="(  d, index ) in disks"
+                    :key="index"
+                    :value="d">
+                    {{ getBaseName(d) }}
+                </option>
+              </b-select>
+              </b-tooltip>
+              </b-field>
+              </font>            
+        </section>        
+        <footer class="modal-card-foot buttons is-right">
+          <button class="button"  type="button" 
+              @click="closeModal('opticalDisc')">
+              Cancel
+          </button>  
+          <button class="button is-success"  @click="changeOpticalDisc(opticalDiscModal.vmName,opticalDiscModal.disc)">
+            {{ getOpticalDiscLabel() }}
+          </button>
+        </footer>
+      </div>
+    </b-modal>
     <hr>
     <div class="level is-vcentered">
       <div class="level-item">
@@ -391,15 +462,7 @@
               <b-button class="button is-light" icon-left="camera" @click="processMultiVmAction(vmActions.captureSnapshot)">
               </b-button>
             </b-tooltip>
-          </div>
-          <div v-if="vmSelectedArray.every(vm => roleAllowed('vms/screenshot', 'update', experiment.name + '/' + vm)) && !showModifyStateBar">
-            &nbsp;
-            <b-tooltip label="record screenshot" type="is-light">
-              <!-- not implemented -->
-              <b-button class="button is-light" icon-left="video" @click="processMultiVmAction(vmActions.recordScreenshots)">
-              </b-button>
-            </b-tooltip>
-          </div>
+          </div>          
           <div v-if="!showModifyStateBar">
             &nbsp;
             <b-tooltip label="modify state" type="is-light">
@@ -449,6 +512,12 @@
         &nbsp;&nbsp;
        <div class="level-item"  style="margin-bottom: -1em;">
         <b-field v-if="roleAllowed('experiments/files', 'list', experiment.name)" position="is-right">
+          <b-tooltip :label="netflow.tooltip" type="is-light">
+            <button :class="`button ${netflow.capturing ? 'is-danger' : 'is-success'}`" @click="handleNetflow(!netflow.capturing)">
+              <b-icon icon="circle-nodes"></b-icon>
+            </button>
+          </b-tooltip>
+          &nbsp; &nbsp;
           <template v-if="this.activeTab == 1">
             <b-tooltip label="search on a specific category" type="is-light">
               <b-select :value="filesTable.category" @input="( value ) => assignCategory( value )" placeholder="All Categories">
@@ -560,7 +629,7 @@
               </template>
               <section v-if="props.row.busy">
                 <p  />
-                <b-progress size="is-small" type="is-warning" show-value :value=props.row.percent format="percent"></b-progress>
+                <b-progress size="is-small" type="is-warning" show-value :value="props.row.percent" format="percent"></b-progress>
               </section>
             </b-table-column>
             <b-table-column field="screenshot"  label="Screenshot" centered v-slot="props">
@@ -685,6 +754,18 @@
                 {{ props.row.uptime | uptime }}
               </template>
             </b-table-column>
+            <b-table-column label="Labels" centered v-slot="props">
+                <template>
+                  <b-tooltip label="View/Edit Labels" type="is-dark">
+                    <div @click="showTagsModal( props.row )" class="is-clickable">
+                      <font-awesome-layers full-width>
+                        <font-awesome-icon  icon="tag" />
+                        <font-awesome-layers-text counter :value="tagCount(props.row.tags)" />
+                      </font-awesome-layers>
+                    </div>
+                  </b-tooltip>
+                </template>
+              </b-table-column>
           </b-table>
           <br>
           <b-field v-if="paginationNeeded" grouped position="is-right">
@@ -758,6 +839,11 @@
             </div>
           </b-field>
         </b-tab-item>
+        <b-tab-item label="Netflow" icon="circle-nodes" v-if="netflow.data">
+          <div class="control">
+            <textarea class="textarea" style="font-family:'Courier New'" readonly rows="40" v-model="netflow.data"></textarea>
+          </div>
+        </b-tab-item>
       </b-tabs>
     </div>
     <b-loading :is-full-page="true" :active.sync="isWaiting" :can-cancel="false"></b-loading>
@@ -767,17 +853,29 @@
 <script>
   import { mapState }        from 'vuex';
   import VmMountBrowserModal from './VMMountBrowserModal.vue';
+  import VmLabelsModal from './VMLabelsModal.vue';
+
 
   import _ from 'lodash';
 
   export  default {
     async beforeDestroy () {
       this.$options.sockets.onmessage = null;
+
+      if (this.socket) {
+        this.socket.close();
+        this.socket = null;
+      }
     },
 
     async created () {
       this.$options.sockets.onmessage = this.handler;
       this.updateExperiment();
+
+      try {
+        await this.$http.get(`experiments/${this.$route.params.id}/netflow`);
+        this.handleNetflow(true, false);
+      } catch { }
     },
 
     computed: {
@@ -918,6 +1016,16 @@
         this.updateFiles();
       }, 
 
+      showTagsModal ( vm ) {
+        this.$buefy.modal.open({
+          parent:       this,
+          component:    VmLabelsModal,
+          trapFocus:    true,
+          hasModalCard: true,
+          props:        {"vmName": vm.name, "experiment": this.$route.params.id, "tags": vm.tags}
+        })
+      },
+
       handler ( event ) {
         event.data.split( /\r?\n/ ).forEach( m => {
           let msg = JSON.parse( m );
@@ -1036,6 +1144,41 @@
               case  'shutdown': {
                 break;
               }
+
+              case 'cdrom-inserted': {
+                this.$buefy.toast.open({
+                  message: 'The optical disc for ' + vm[ 1 ] + ' was successfully inserted.',
+                  type: 'is-success',
+                  duration: 4000
+                });
+
+                // Refresh the VM
+                for ( let i = 0; i < vms.length; i++ ) {
+                  if ( vms[i].name == vm[ 1 ] ) {
+                    this.getInfo(vms[i]);
+                    break;
+                  }
+                }
+                
+                break;
+              }
+
+              case 'cdrom-ejected': {
+                this.$buefy.toast.open({
+                  message: 'The optical disc for ' + vm[ 1 ] + ' was successfully ejected.',
+                  type: 'is-success',
+                  duration: 4000
+                });
+
+                // Refresh the VM
+                for ( let i = 0; i < vms.length; i++ ) {
+                  if ( vms[i].name == vm[ 1 ] ) {
+                    this.getInfo(vms[i]);
+                    break;
+                  }
+                }
+                break;
+              }
         
               case  'redeployed': {
                 this.$buefy.toast.open({
@@ -1139,11 +1282,7 @@
               }
 
               case  'progress': {
-                 //this.$buefy.toast.open({
-                 //     message: 'PROGRESS',
-                 //     duration: 200
-                 //   });
-                let percent = ( msg.result.percent * 100 ).toFixed( 0 );
+                let percent = Math.round( msg.result.percent * 100 );
 
                 for ( let i = 0; i < vms.length; i++ ) {
                   if  ( vms[i].name == vm[ 1 ] ) {
@@ -1170,20 +1309,19 @@
                 for ( let i = 0; i < vms.length; i++ ) {
                   if  ( vms[i].name == vm[ 1 ] ) {
                     vms[i].busy = false;
-                    vms[i] = msg.result.vm;                    
-                      let disk  = msg.result.disk;
-                  
-                      this.$buefy.toast.open({
-                        message: 'A memory snapshot was created with name ' + disk + ' for the ' + vm[ 1 ] + ' VM was successfully created.',
-                        type: 'is-success',
-                        duration: 4000
-                      });
-                      this.experiment.vms = [ ...vms ];
-                      break;
-                    }
+                    let disk  = msg.result.disk;
+                
+                    this.$buefy.toast.open({
+                      message: 'A memory snapshot was created with name ' + disk + ' for the ' + vm[ 1 ] + ' VM was successfully created.',
+                      type: 'is-success',
+                      duration: 4000
+                    });
+                    this.experiment.vms = [ ...vms ];
+                    break;
                   }
-                  break;
                 }
+                break;
+              }
               case  'committing': {
 
                 for ( let i = 0; i < vms.length; i++ ) {
@@ -1224,6 +1362,9 @@
           case  'experiment/vm/screenshot': {
             let vm = msg.resource.name.split( '/' );
             let vms = this.experiment.vms;
+            if (!vms) {
+              break;
+            }
 
             switch ( msg.resource.action ) {
               case  'update': {                
@@ -1297,6 +1438,9 @@
           case  'experiment/vm/snapshot': {
             let vm = msg.resource.name.split( '/' );
             let vms = this.experiment.vms;
+            if (!vms) {
+              break;
+            }
 
             switch ( msg.resource.action ) {
               case  'create': {
@@ -1335,7 +1479,7 @@
               }
 
               case  'progress': {
-                let percent = ( msg.result.percent * 100 ).toFixed( 0 );
+                let percent = Math.round(msg.result.percent * 100 );
 
                 for ( let i = 0; i < vms.length; i++ ) {
                   if  ( vms[i].name == vm[ 1 ] ) {
@@ -1402,7 +1546,7 @@
         return false;
       },
 
-      async updateExperiment  () {
+      async updateExperiment () {
         try {
           let resp  = await this.$http.get('experiments/' + this.$route.params.id);
           let state = await resp.json();
@@ -1420,26 +1564,22 @@
         }
       },
     
-      updateDisks ()  {
+      updateDisks (diskType="")  {
         this.disks = [];
-      
-        this.$http.get( 'disks' ).then(
+        this.isWaiting = true
+
+        this.$http.get( `disks?diskType=${diskType}` ).then(
           response  => {
             response.json().then(
-              state =>  {
-                if ( state.disks.length == 0 ) {
-                  this.isWaiting  = true;
-                } else {
-                  for ( let i = 0;  i < state.disks.length; i++ ) {
-                    this.disks.push( state.disks[i] );
-                  }
-                  
-                  this.isWaiting  = false;
+              state => {
+                this.isWaiting = false
+
+                for ( let i = 0;  i < state.disks.length; i++ ) {
+                  this.disks.push( state.disks[i] );
                 }
               }
             );
           },  err => {
-            console.log('Getting the disks failed with ' + err.status);
             this.isWaiting = false;
             this.errorNotification(err);
           }
@@ -1543,60 +1683,72 @@
         this.updateFiles();
       },
 
-      getInfo ( vm  ) {
+      async fetchVMDetails(vm) {
+        let url  = `experiments/${this.$route.params.id}/vms/${vm.name}`;
+        let resp = await this.$http.get(url);
+
+        return await resp.json();
+      },
+
+      async fetchVMSnapshots(vm) {
+        let url  = `experiments/${this.$route.params.id}/vms/${vm.name}/snapshots`;
+        let resp = await this.$http.get(url);
+
+        return await resp.json();
+      },
+
+      async fetchVMForwards(vm) {
+        let url  = `experiments/${this.$route.params.id}/vms/${vm.name}/forwards`;
+        let resp = await this.$http.get(url);
+
+        return await resp.json();
+      },
+
+      async getInfo (vm) {
         if(vm.busy){
           this.$buefy.dialog.alert({
             title: 'VM Busy',
             message: ['VM',vm.name,'is currently busy and not available for another action'].join(' '),
             confirmText: 'Ok'
           })       
+
           return
         }
-        
-          this.$http.get(
-            'experiments/' + this.$route.params.id + '/vms/' + vm.name + '/snapshots'
-          ).then(
-            response => { 
-              return  response.json().then(
-                json => {
-                  if  ( json.snapshots.length > 0 ) {
-                    this.expModal.snapshots = json.snapshots;
-                  }
-                }
-              )
-            }, err => {
-              this.errorNotification(err);
-              this.isWaiting = false;
-            }
-          );
 
-          // get updated details for this vm
-          this.$http.get(
-            'experiments/' + this.$route.params.id + '/vms/' + vm.name
-          ).then(
-            response => { 
-              return  response.json().then(
-                json => {
-                  this.expModal.vm = json;
-                }
-              )
-            }, response => {
-              this.$buefy.toast.open({
-                message: 'Getting updated info for the ' + vm.name + ' VM failed with ' + response.status + ' status.',
-                type: 'is-danger',
-                duration: 4000
-              });
+        try {
+          const [details, snapshots, forwards] = await Promise.all([
+            this.fetchVMDetails(vm),
+            this.fetchVMSnapshots(vm),
+            this.fetchVMForwards(vm),
+          ])
 
-              this.isWaiting  = false;
+          this.expModal.vm = details;
+
+          if (snapshots.snapshots && snapshots.snapshots.length > 0) {
+            this.expModal.snapshots = snapshots.snapshots;
+          }
+
+          this.expModal.forwards = [];
+
+          if (forwards.listeners) {
+            for (let i = 0; i < forwards.listeners.length; i++) {
+              let l = forwards.listeners[i];
+
+              l.desc = `${l.srcPort} --> ${l.dstHost}:${l.dstPort}`;
+              l.canDelete = this.$store.getters.username === l.owner;
+
+              this.expModal.forwards.push(l);
             }
-          );
-          this.expModal.vm  = vm;
+          }
+
           this.expModal.fullName = this.experiment.name + '/' + vm.name;
-          this.expModal.active  = true;
-        
+          this.expModal.active   = true;
+        } catch (err) {
+          this.errorNotification(err);
+        }
       },
 
-      snapshots ( vm  ) {
+      snapshots ( vm ) {
         this.$http.get(
           'experiments/'  + this.$route.params.id + '/vms/' + vm.name + '/snapshots'
         ).then(
@@ -1615,7 +1767,7 @@
         );
       },
 
-      captureSnapshot ( name  ) {
+      captureSnapshot ( name ) {
         if (! Array.isArray(name)) {
           name  = [name];
         }
@@ -2652,13 +2804,38 @@
           }
         })
       },
+
+      changeOpticalDisc (vmName,isoPath) {
+        this.opticalDiscModal.active = false;  
+
+        let url = `experiments/${this.$route.params.id}/vms/${vmName}/cdrom`
+
+        if (this.getOpticalDiscLabel().indexOf('eject') != -1) {
+          this.$http.delete(url).then(
+            null, err => {
+              this.errorNotification(err);
+            }
+          );
+        } else {
+          url += `?isoPath=${isoPath}`
+
+          this.$http.post(url).then(
+            null, err => {
+              this.errorNotification(err);
+            }
+          );
+        }
+
+        this.resetOpticalDiscModal;        
+      },
       
       resetExpModal ()  {        
         this.expModal = {
           active: false,
           fullName: '',
           vm: [],
-          snapshots:  false
+          snapshots: false,
+          forwards: []
         }
         this.showModifyStateBar = false;
       },
@@ -2687,7 +2864,7 @@
       },
 
       getApps () {
-        let defaultApps = ['ntp', 'serial', 'startup', 'vrouter'];
+        let defaultApps = ['ntp', 'serial', 'startup', 'vrouter', 'scorch'];
 
         this.appsModal.triggerable = this.experiment.apps.filter(a => !defaultApps.includes(a));
         this.appsModal.active = true;
@@ -2718,7 +2895,20 @@
         this.fileViewerModal.title = null;
         this.fileViewerModal.contents = null;
       },
-      
+
+      resetOpticalDiscModal () {
+        this.opticalDiscModal.active = false;
+        this.opticalDiscModal.disc = ""; 
+        this.opticalDiscModal.vmName = null;       
+      },
+
+      showChangeDisc(vm) {
+        this.updateDisks("ISO")
+        this.opticalDiscModal.vmName = vm.name;
+        this.opticalDiscModal.active = true;        
+        this.opticalDiscModal.disc = vm.cdRom;                
+      },
+
       validate (modalVMQueue) {  
         var regexp = /^[a-zA-Z0-9-_]+$/;
         for ( let i = 0; i < modalVMQueue.vm.length; i++ ) {
@@ -2844,8 +3034,29 @@
         return diskName.substring(diskName.lastIndexOf("/")+1);       
       },
 
-      getDiskToolTip(fullPath) {       
-        return this.disks.indexOf(fullPath) == -1 ? "menu for assigning vm(s) disk" : fullPath
+      getOpticalDiscLabel () {    
+
+        if (this.expModal.vm.cdRom === undefined) {
+          return "insert optical disc"
+        }
+
+        // If there is an existing disc in the VM, see 
+        // if the disc was changed
+        if (this.expModal.vm.cdRom.length > 0 && this.opticalDiscModal.disc.length > 0) {
+
+          return String(this.expModal.vm.cdRom) != String(this.opticalDiscModal.disc) ? "change optical disc" : "eject optical disc"            
+        }
+        else if (this.expModal.vm.cdRom.length > 0) {
+          return "eject optical disc"
+        }
+        else {
+          return "insert optical disc"
+        }   
+              
+      },
+
+      getDiskToolTip(fullPath,defaultMessage="menu for assigning vm(s) disk") {       
+        return this.disks.indexOf(fullPath) == -1 ? defaultMessage : fullPath
       },
 
       isSubnetPresent () { 
@@ -2880,6 +3091,7 @@
 
       showMountDialog(vm) {
         this.resetExpModal()
+
         this.$buefy.modal.open({
           parent:       this,
           component:    VmMountBrowserModal,
@@ -2888,6 +3100,134 @@
           canCancel:    [],
           props:        {"targetVm": vm, "targetExp": this.$route.params.id}
         })
+      },
+
+      showPortForwardDialog(vm) {
+        this.portForwardModal.vmName = vm;
+        this.portForwardModal.active = true;
+      },
+
+      resetPortForwardModal() {
+        this.portForwardModal = {
+          active:  false,
+          vmName:  null,
+          srcPort: null,
+          dstHost: '127.0.0.1',
+          dstPort: null
+        }
+      },
+
+      async createPortForward() {
+        let url    = `experiments/${this.$route.params.id}/vms/${this.portForwardModal.vmName}/forwards`;
+        let params = `?src=${this.portForwardModal.srcPort}&host=${this.portForwardModal.dstHost}&dst=${this.portForwardModal.dstPort}`
+
+        try {
+          await this.$http.post(url + params);
+
+          let resp = await this.$http.get(url);
+          let json = await resp.json();
+
+          this.expModal.forwards = [];
+
+          if (json.listeners) {
+            for (let i = 0; i < json.listeners.length; i++) {
+              let l = json.listeners[i];
+
+              l.desc = `${l.srcPort} --> ${l.dstHost}:${l.dstPort}`;
+              l.canDelete = this.$store.getters.username === l.owner;
+
+              this.expModal.forwards.push(l);
+            }
+          }
+        } catch (err) {
+          this.errorNotification(err);
+        } finally {
+          this.resetPortForwardModal();
+        }
+      },
+
+      async deletePortForward(vm, forward) {
+        let url    = `experiments/${this.$route.params.id}/vms/${vm}/forwards`;
+        let params = `?host=${forward.dstHost}&dst=${forward.dstPort}`
+
+        try {
+          await this.$http.delete(url + params);
+
+          let resp = await this.$http.get(url);
+          let json = await resp.json();
+
+          this.expModal.forwards = [];
+
+          if (json.listeners) {
+            for (let i = 0; i < json.listeners.length; i++) {
+              let l = json.listeners[i];
+
+              l.desc = `${l.srcPort} --> ${l.dstHost}:${l.dstPort}`;
+              l.canDelete = this.$store.getters.username === l.owner;
+
+              this.expModal.forwards.push(l);
+            }
+          }
+        } catch (err) {
+          this.errorNotification(err);
+        }
+      },
+
+      handleNetflow(start, create = true) {
+        if (start) {
+          let created = true;
+
+          if (create) {
+            this.$http.post(`experiments/${this.$route.params.id}/netflow`).then(
+              _ => { }, err => {
+                this.errorNotification(err);
+                created = false;
+              }
+            );
+          }
+
+          if (created) {
+            this.netflow.capturing  = true;
+            this.netflow.tooltip    = "Stop Netflow Capture";
+            this.netflow.data      += '### CAPTURE START ###\n';
+
+            let path = `${process.env.BASE_URL}api/v1/experiments/${this.$route.params.id}/netflow/ws`;
+
+            if (this.$store.getters.token) {
+              path += `?token=${this.$store.getters.token}`;
+            }
+
+            let proto = location.protocol == "https:" ? "wss://" : "ws://";
+            let url   = proto + location.host + path;
+
+            this.socket = new WebSocket(url);
+            this.socket.addEventListener("message", (event) => {
+              event.data.split(/\r?\n/).forEach(data => {
+                if (data) {
+                  let msg  = JSON.parse(data);
+                  let flow = `${msg['src']}:${msg['sport']}\t\t-->\t${msg['dst']}:${msg['dport']}\t\t${msg['proto']}\t${msg['packets']}\t${msg['bytes']}\n`;
+
+                  this.netflow.data += flow;
+                }
+              });
+            });
+          }
+        } else {
+          this.$http.delete(`experiments/${this.$route.params.id}/netflow`).then(
+            _ => {
+              this.netflow.capturing  = false;
+              this.netflow.tooltip    = "Start Netflow Capture";
+              this.netflow.data      += '### CAPTURE STOP ###\n';
+
+              if (this.socket) {
+                this.socket.close();
+                this.socket = null;
+              }
+            }, err => {
+              this.errorNotification(err);
+            }
+          );
+        }
       }
     },
     
@@ -2923,7 +3263,15 @@
           active: false,
           vm: [],
           fullName: '',
-          snapshots:  false
+          snapshots: false,
+          forwards: []
+        },
+        portForwardModal: {
+          active:  false,
+          vmName:  null,
+          srcPort: null,
+          dstHost: '127.0.0.1',
+          dstPort: null
         },
         vlanModal: {
           active: false,
@@ -2968,6 +3316,11 @@
           title: null,
           contents: null
         },
+        opticalDiscModal: {
+          active: false,
+          disc: "",
+          vmName: null          
+        },
         apps: null,
         experiment: [],
         files: [],
@@ -2993,14 +3346,23 @@
         searchHistory: [],
         searchHistoryLength:10,
         searchPlaceholder:"Find a VM",
-        activeTab:0        
+        activeTab:0,
+        netflow: {
+          tooltip: "Start Netflow Capture",
+          capturing: false,
+          socket: null,
+          data: ''
+        }
       }
     }
   }
 </script>
 
 <style scoped>
-div.autocomplete >>> a.dropdown-item {
-  color:  #383838 !important;
-}
+  div.autocomplete >>> a.dropdown-item {
+    color:  #383838 !important;
+  }
+  .fa-layers-counter { /* counter on tag icon */
+    transform: scale(.7) translateX(50%) translateY(-50%);
+  }
 </style>

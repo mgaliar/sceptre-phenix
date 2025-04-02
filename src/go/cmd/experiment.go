@@ -17,6 +17,7 @@ import (
 	"phenix/types"
 	"phenix/util"
 	"phenix/util/notes"
+	"phenix/util/plog"
 	"phenix/util/printer"
 	"phenix/util/sigterm"
 
@@ -48,7 +49,7 @@ func newExperimentListCmd() *cobra.Command {
 			}
 
 			if len(exps) == 0 {
-				fmt.Println("\nThere are no experiments available\n")
+				plog.Warn("no experiments available")
 			} else {
 				printer.PrintTableOfExperiments(os.Stdout, exps...)
 			}
@@ -68,7 +69,7 @@ func newExperimentAppsCmd() *cobra.Command {
 			apps := app.List()
 
 			if len(apps) == 0 {
-				fmt.Printf("\nApps: none\n\n")
+				plog.Warn("no apps available")
 				return nil
 			}
 
@@ -89,7 +90,7 @@ func newExperimentSchedulersCmd() *cobra.Command {
 			schedulers := scheduler.List()
 
 			if len(schedulers) == 0 {
-				fmt.Printf("\nSchedulers: none\n\n")
+				plog.Warn("no schedulers available")
 				return nil
 			}
 
@@ -113,7 +114,8 @@ func newExperimentCreateCmd() *cobra.Command {
 	example := `
   phenix experiment create <experiment name> -t <topology name or /path/to/filename>
   phenix experiment create <experiment name> -t <topology name or /path/to/filename> -s <scenario name or /path/to/filename>
-  phenix experiment create <experiment name> -t <topology name or /path/to/filename> -s <scenario name or /path/to/filename> -d </path/to/dir/>`
+  phenix experiment create <experiment name> -t <topology name or /path/to/filename> -s <scenario name or /path/to/filename> -d </path/to/dir/>
+  phenix experiment create <experiment name> -t <topology name or /path/to/filename> -s <scenario name or /path/to/filename> --disabled-apps "app1,app2"`
 
 	cmd := &cobra.Command{
 		Use:     "create <experiment name>",
@@ -122,7 +124,7 @@ func newExperimentCreateCmd() *cobra.Command {
 		Example: example,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
-				return fmt.Errorf("Must provide an experiment name")
+				return fmt.Errorf("must provide an experiment name")
 			}
 
 			var (
@@ -156,6 +158,15 @@ func newExperimentCreateCmd() *cobra.Command {
 				scenario = c.Metadata.Name
 			}
 
+			disabledApps, err := cmd.Flags().GetStringSlice("disabled-apps")
+			if err != nil {
+				err := util.HumanizeError(err, "Bad list of disabled-apps provided: %v", disabledApps)
+				return err.Humanized()
+			}
+			for idx := range disabledApps {
+				disabledApps[idx] = strings.TrimSpace(disabledApps[idx])
+			}
+
 			opts := []experiment.CreateOption{
 				experiment.CreateWithName(args[0]),
 				experiment.CreateWithTopology(topology),
@@ -163,6 +174,8 @@ func newExperimentCreateCmd() *cobra.Command {
 				experiment.CreateWithBaseDirectory(MustGetString(cmd.Flags(), "base-dir")),
 				experiment.CreateWithVLANMin(MustGetInt(cmd.Flags(), "vlan-min")),
 				experiment.CreateWithVLANMax(MustGetInt(cmd.Flags(), "vlan-max")),
+				experiment.CreatedWithDisabledApplications(disabledApps),
+				experiment.CreateWithDefaultBridge(MustGetString(cmd.Flags(), "default-bridge")),
 			}
 
 			ctx := notes.Context(context.Background(), false)
@@ -174,7 +187,7 @@ func newExperimentCreateCmd() *cobra.Command {
 
 			notes.PrettyPrint(ctx, false)
 
-			fmt.Printf("The %s experiment was created\n", args[0])
+			plog.Info("experiment created", "exp", args[0])
 
 			return nil
 		},
@@ -184,9 +197,10 @@ func newExperimentCreateCmd() *cobra.Command {
 	cmd.MarkFlagRequired("topology")
 	cmd.Flags().StringP("scenario", "s", "", "Name of an existing scenario to use (optional)")
 	cmd.Flags().StringP("base-dir", "d", "", "Base directory to use for experiment (optional)")
+	cmd.Flags().StringP("default-bridge", "b", "phenix", "Default bridge name to use for experiment (optional)")
 	cmd.Flags().Int("vlan-min", 0, "VLAN pool minimum")
 	cmd.Flags().Int("vlan-max", 0, "VLAN pool maximum")
-
+	cmd.Flags().StringSlice("disabled-apps", []string{}, "Comma separated ist of apps to disable")
 	return cmd
 }
 
@@ -233,7 +247,7 @@ func newExperimentDeleteCmd() *cobra.Command {
 	desc := `Delete an experiment
 
   Used to delete an exisitng experiment; experiment must be stopped.
-  Using 'all' instead of a specific experiment name will include all 
+  Using 'all' instead of a specific experiment name will include all
   stopped experiments`
 
 	cmd := &cobra.Command{
@@ -267,7 +281,7 @@ func newExperimentDeleteCmd() *cobra.Command {
 
 			for _, exp := range experiments {
 				if exp.Running() {
-					fmt.Printf("Not deleting running experiment %s\n", exp.Metadata.Name)
+					plog.Warn("not deleting running experiment", "exp", exp.Metadata.Name)
 					continue
 				}
 
@@ -277,7 +291,7 @@ func newExperimentDeleteCmd() *cobra.Command {
 					continue
 				}
 
-				fmt.Printf("The %s experiment was deleted\n", exp.Metadata.Name)
+				plog.Info("experiment deleted", "exp", exp.Metadata.Name)
 			}
 
 			return nil
@@ -289,8 +303,8 @@ func newExperimentDeleteCmd() *cobra.Command {
 
 func newExperimentScheduleCmd() *cobra.Command {
 	desc := `Schedule an experiment
-	
-  Apply an algorithm to a given experiment. Run 'phenix experiment schedulers' 
+
+  Apply an algorithm to a given experiment. Run 'phenix experiment schedulers'
   to return a list of algorithms`
 
 	cmd := &cobra.Command{
@@ -309,7 +323,7 @@ func newExperimentScheduleCmd() *cobra.Command {
 				return err.Humanized()
 			}
 
-			fmt.Printf("The %s experiment was scheduled with %s\n", args[0], args[1])
+			plog.Info("experiment scheduled", "exp", args[0], "algorithm", args[1])
 
 			return nil
 		},
@@ -321,10 +335,10 @@ func newExperimentScheduleCmd() *cobra.Command {
 func newExperimentStartCmd() *cobra.Command {
 	desc := `Start an experiment
 
-  Used to start a stopped experiment, using 'all' instead of a specific 
-  experiment name will include all stopped experiments; dry-run will do 
+  Used to start a stopped experiment, using 'all' instead of a specific
+  experiment name will include all stopped experiments; dry-run will do
 	everything but call out to minimega.
-	
+
 	NOTE: passing the --honor-run-periodically flag will prevent the CLI from
 	returning. If Ctrl+c is pressed, the experiment will continue to run but
 	the running stage will no longer continue to be triggered for any apps
@@ -367,7 +381,7 @@ func newExperimentStartCmd() *cobra.Command {
 
 			for _, exp := range experiments {
 				if exp.Running() {
-					fmt.Printf("Not starting already running experiment %s\n", exp.Metadata.Name)
+					plog.Warn("not starting already running experiment", "exp", exp.Metadata.Name)
 					continue
 				}
 
@@ -386,17 +400,13 @@ func newExperimentStartCmd() *cobra.Command {
 
 				notes.PrettyPrint(ctx, false)
 
-				if dryrun {
-					fmt.Printf("The %s experiment was started in a dry-run\n", exp.Metadata.Name)
-				} else {
-					fmt.Printf("The %s experiment was started\n", exp.Metadata.Name)
-				}
+				plog.Info("experiment started", "exp", exp.Metadata.Name, "dryrun", dryrun, "deploy-mode", exp.Spec.DeployMode())
 
 				if periodic {
-					fmt.Println("honor-run-periodically flag was passed")
+					plog.Info("honor-run-periodically flag was passed")
 
 					if err := app.PeriodicallyRunApps(ctx, &wg, &exp); err != nil {
-						fmt.Printf("Error scheduling experiment apps to run periodically: %v\n", err)
+						plog.Error("scheduling experiment apps to run periodically", "err", err)
 					}
 				}
 			}
@@ -423,7 +433,7 @@ func newExperimentStartCmd() *cobra.Command {
 func newExperimentStopCmd() *cobra.Command {
 	desc := `Stop an experiment
 
-  Used to stop a running experiment, using 'all' instead of a specific 
+  Used to stop a running experiment, using 'all' instead of a specific
   experiment name will include all running experiments.`
 
 	cmd := &cobra.Command{
@@ -457,7 +467,7 @@ func newExperimentStopCmd() *cobra.Command {
 
 			for _, exp := range experiments {
 				if !exp.Running() {
-					fmt.Printf("Not stopping already stopped experiment %s\n", exp.Metadata.Name)
+					plog.Warn("not stopping already stopped experiment", "exp", exp.Metadata.Name)
 					continue
 				}
 
@@ -466,7 +476,7 @@ func newExperimentStopCmd() *cobra.Command {
 					return err.Humanized()
 				}
 
-				fmt.Printf("The %s experiment was stopped\n", exp.Metadata.Name)
+				plog.Info("experiment stopped", "exp", exp.Metadata.Name)
 			}
 
 			return nil
@@ -479,8 +489,8 @@ func newExperimentStopCmd() *cobra.Command {
 func newExperimentRestartCmd() *cobra.Command {
 	desc := `Restart an experiment
 
-  Used to restart a running experiment, using 'all' instead of a specific 
-  experiment name will include all running experiments; dry-run will do 
+  Used to restart a running experiment, using 'all' instead of a specific
+  experiment name will include all running experiments; dry-run will do
   everything but call out to minimega.`
 
 	cmd := &cobra.Command{
@@ -517,7 +527,7 @@ func newExperimentRestartCmd() *cobra.Command {
 
 			for _, exp := range experiments {
 				if !exp.Running() {
-					fmt.Printf("Not restarting stopped experiment %s\n", exp.Metadata.Name)
+					plog.Warn("not restarting stopped experiment", "exp", exp.Metadata.Name)
 					continue
 				}
 
@@ -531,7 +541,7 @@ func newExperimentRestartCmd() *cobra.Command {
 					return err.Humanized()
 				}
 
-				fmt.Printf("The %s experiment was restarted\n", exp.Metadata.Name)
+				plog.Info("experiment restarted", "exp", exp.Metadata.Name, "dryrun", dryrun, "deploy-mode", exp.Spec.DeployMode())
 			}
 
 			return nil
@@ -582,7 +592,7 @@ func newExperimentReconfigureCmd() *cobra.Command {
 
 			for _, exp := range experiments {
 				if exp.Running() {
-					fmt.Printf("Not reconfiguring running experiment %s\n", exp.Metadata.Name)
+					plog.Warn("not reconfiguring running experiment", "exp", exp.Metadata.Name)
 					continue
 				}
 
@@ -591,7 +601,7 @@ func newExperimentReconfigureCmd() *cobra.Command {
 					return err.Humanized()
 				}
 
-				fmt.Printf("The %s experiment was reconfigured\n", exp.Metadata.Name)
+				plog.Info("experiment reconfigured", "exp", exp.Metadata.Name)
 			}
 
 			return nil
@@ -645,7 +655,7 @@ func newExperimentTriggerRunningCmd() *cobra.Command {
 
 			for _, exp := range experiments {
 				if !exp.Running() {
-					fmt.Printf("Not triggering the running stage for apps in the stopped experiment %s\n", exp.Metadata.Name)
+					plog.Warn("not triggering the running stage for apps in stopped experiment", "exp", exp.Metadata.Name)
 					continue
 				}
 
@@ -654,7 +664,7 @@ func newExperimentTriggerRunningCmd() *cobra.Command {
 					return err.Humanized()
 				}
 
-				fmt.Printf("Apps in the %s experiment had their running stage triggered\n", exp.Metadata.Name)
+				plog.Info("running stage triggered for apps", "exp", exp.Metadata.Name)
 			}
 
 			return nil
@@ -699,7 +709,7 @@ func newExperimentScorchCmd() *cobra.Command {
 				return err.Humanized()
 			}
 
-			fmt.Printf("Scorch run %d successfully triggered for experiment %s\n", run, exp.Metadata.Name)
+			plog.Info("scorch run triggered", "exp", exp.Metadata.Name, "run", run)
 
 			return nil
 		},

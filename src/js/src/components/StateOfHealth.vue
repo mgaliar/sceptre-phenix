@@ -1,20 +1,29 @@
 <template>
   <div>
-    <b-modal :active.sync="detailsModal.active" :on-cancel="resetDetailsModal" has-modal-card full-screen>
-      <div class="modal-card">
+    <b-modal :active.sync="detailsModal.active" :on-cancel="resetDetailsModal" has-modal-card :width="1280">
+      <div class="modal-card" style="width: auto;">
         <header class="modal-card-head">
           <p class="modal-card-title">{{ detailsModal.vm }} Details</p>
         </header>
         <section class="modal-card-body">
+          <p class="title is-4">Notes</p>
+          <div class="content">
+            <ul>
+              <li v-for="k in Object.keys(detailsModal.tags).filter(k => k.startsWith('__notes_'))">
+                <p style="white-space: pre-line;">{{ detailsModal.tags[k] }}</p>
+              </li>
+            </ul>
+          </div>
+          <hr>
+          <p class="title is-4">State of Health</p>
           <template v-if="detailsModal.soh">
-            <p>The following state of health has been reported for {{ detailsModal.vm }}.</p>
             <br>
             <div v-if="detailsModal.soh.cpuLoad">
-              <p class="title is-5">CPU Load: {{ detailsModal.soh.cpuLoad }}</p>
+              <p class="title is-6">CPU Load: {{ detailsModal.soh.cpuLoad }}</p>
             </div>
             <br>
             <div v-if="detailsModal.soh.networking">
-              <p class="title is-5">Networking</p>
+              <p class="title is-6">Networking</p>
               <b-table
                 :data="detailsModal.soh.networking"
                 default-sort="timestamp">
@@ -31,7 +40,7 @@
               <br>
             </div>
             <div v-if="detailsModal.soh.reachability">
-              <p class="title is-5">Reachability</p>
+              <p class="title is-6">Reachability</p>
               <b-table
                 :data="detailsModal.soh.reachability"
                 default-sort="timestamp">
@@ -54,7 +63,7 @@
               <br>
             </div>
             <div v-if="detailsModal.soh.processes">
-              <p class="title is-5">Processes</p>
+              <p class="title is-6">Processes</p>
               <b-table
                 :data="detailsModal.soh.processes"
                 default-sort="timestamp">
@@ -74,7 +83,7 @@
               <br>
             </div>
             <div v-if="detailsModal.soh.listeners">
-              <p class="title is-5">Listeners</p>
+              <p class="title is-6">Listeners</p>
               <b-table
                 :data="detailsModal.soh.listeners"
                 default-sort="timestamp">
@@ -94,7 +103,7 @@
               <br>
             </div>
             <div v-if="detailsModal.soh.customTests">
-              <p class="title is-5">Custom User Tests</p>
+              <p class="title is-6">Custom User Tests</p>
               <b-table
                 :data="detailsModal.soh.customTests"
                 default-sort="test">
@@ -119,9 +128,19 @@
           </template>
         </section>
         <footer class="modal-card-foot buttons is-right">
+          <template v-if="roleAllowed('vms', 'patch', this.$route.params.id + '/' + detailsModal.vm)">
+            <b-tooltip label="edit notes/labels" type="is-light is-left" :delay="400">
+              <b-button class="button is-light" icon-left="tag" @click="showTagsModal(detailsModal.vm, detailsModal.tags)"/>
+            </b-tooltip>
+          </template>
+          <template v-if="roleAllowed('vms', 'patch', this.$route.params.id + '/' + detailsModal.vm)">
+            <b-tooltip label="customize style" type="is-light is-left" :delay="400">
+              <b-button class="button is-light" icon-left="paintbrush" @click="showStyleModal(detailsModal.vm)"/>
+            </b-tooltip>
+          </template>
           <template v-if="detailsModal.status.toLowerCase() == 'running'">
             <a :href="vncLoc(detailsModal.vm)" target="_blank">
-              <b-tooltip label="open vnc for a running vm" type="is-light is-left" :delay="800">
+              <b-tooltip label="open vnc for a running vm" type="is-light is-left" :delay="400">
                 <b-button type="is-success">
                   <b-icon icon="tv" />
                 </b-button>
@@ -129,7 +148,7 @@
             </a>
           </template>
           <template v-else>
-            <b-tooltip label="vnc is only available on a running vm" type="is-light is-left" :delay="600">
+            <b-tooltip label="vnc is only available on a running vm" type="is-light is-left" :delay="400">
               <b-button type="is-danger" disabled>
                 <b-icon icon="tv" />
               </b-button>
@@ -138,6 +157,55 @@
         </footer>
       </div>
     </b-modal>
+    <!-- END MODAL -->
+    <!-- STYLE MODAL -->
+    <b-modal :active.sync="styleModal.active" :on-cancel="resetStyleModal" has-modal-card>
+      <div class="modal-card">
+        <header class="modal-card-head">
+          <p class="modal-card-title">{{ detailsModal.vm }} Style</p>
+        </header>
+        <section class="modal-card-body">
+          <div class="columns is-vcentered">
+            <div class="column is-three-quarters">
+              <p class="title is-6 mb-2">Fill Color</p>
+              <b-field grouped>
+                <b-switch :left-label="true" v-model="styleModal.overrideFill">Override</b-switch>
+                <b-colorpicker :append-to-body="true" :disabled="!styleModal.overrideFill" v-model="styleModal.fill" />
+              </b-field>
+
+              <p class="title is-6 mb-2">Stroke Color</p>
+              <b-field grouped>
+                <b-switch :left-label="true" v-model="styleModal.overrideStroke">Override</b-switch>
+                <b-colorpicker :append-to-body="true" :disabled="!styleModal.overrideStroke" v-model="styleModal.stroke"/>
+              </b-field>
+
+              <p class="title is-6 mb-2">Stroke Style</p>
+              <b-field grouped>
+                <b-switch :left-label="true" v-model="styleModal.overrideStrokeStyle">Override</b-switch>
+                <b-select :disabled="!styleModal.overrideStrokeStyle" v-model="styleModal.strokeStyle">
+                  <option value="solid">Solid</option>
+                  <option value="dashed">Dashed</option>
+                  <option value="dotted">Dotted</option>
+                </b-select> 
+              </b-field>
+            </div>
+            <div class="column has-text-centered">
+              <p>Preview:</p>
+              <svg height="64" width="64" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="8" cy="8" r="5" stroke-width="1.5" transform="scale(4)" :fill="styleModal.baseFill" :stroke="styleModal.baseStroke" :style="styleModalCustomStyle"></circle>
+              </svg>
+            </div>
+          </div>
+
+        </section>
+        <footer class="modal-card-foot buttons is-right">
+          <b-button label="Close" @click="resetStyleModal()" />
+          <b-button v-if="roleAllowed('vms', 'patch', this.$route.params.id + '/' + styleModal.vm)" label="Save" type="is-primary" @click="saveStyle()"/>
+        
+        </footer>
+      </div>
+    </b-modal>
+    <!-- END STYLE MODAL -->
     <hr>
     <div class="columns is-centered"> 
       <div class="column is-1">
@@ -173,9 +241,23 @@
               <b-button @click="resetNetwork" type="is-light">Refresh Network</b-button>
             </div>
             <div class="column">
-              <b-tooltip :label="triggerTooltip" type="is-light">
-                <b-button @click="execSoH" type="is-light" :disabled="!running || triggered">Manual Refresh</b-button>
-              </b-tooltip>
+              <div v-if="!running">
+                <b-button type="is-light" disabled>Exp Not Running</b-button>
+              </div>
+              <div v-else-if="sohRunning">
+                <div v-if="sohInitialized">
+                  <b-button type="is-light" disabled>SOH Is Running</b-button>
+                </div>
+                <div v-else>
+                  <b-button type="is-light" disabled>SOH Is Initializing</b-button>
+                </div>
+              </div>
+              <div v-else-if="!sohInitialized">
+                <b-button type="is-light" disabled>SOH Not Initialized</b-button>
+              </div>
+              <div v-else>
+                <b-button @click="execSoH" type="is-light">Run SOH</b-button>
+              </div>
             </div>
             <div class="column" />
           </div>
@@ -220,7 +302,7 @@
             <div class="column is-one-fifth">
               <div class="columns is-variable is-1">
                 <div class="column has-text-right">
-                  <b-icon icon="circle" style="color: #941100" />
+                  <b-icon icon="circle" style="color: #670b00" />
                 </div>
                 <div class="column">
                   <span style="color: whitesmoke;">Not running</span>
@@ -341,7 +423,9 @@
 </template>
 
 <script>
+const SOH_STYLE_LABEL_KEY = "__sohStyle";
 import * as d3 from "d3";
+import VmLabelsModal from './VMLabelsModal.vue';
 
 import Linux    from "@/assets/linux.svg";
 import CentOS   from "@/assets/centos.svg";
@@ -384,31 +468,47 @@ export default {
               this.resetNetwork();
               break;
             }
+
             case 'start': {
               this.resetNetwork();
               break;
             }
-            case 'triggering': {
-              this.triggered = true;
-              this.triggerTooltip = "Refresh in progress..."
-              break;
-            }
-            case 'trigger': {
-              this.resetNetwork();
-              this.triggered = false;
-              this.triggerTooltip = '';
-              break;
-            }
-            case 'errorTriggering': {
-              this.$buefy.toast.open ({
-                message: 'Triggering State of Health update failed.',
-                type: 'is-danger',
-              });
+          }
+        }
 
-              this.triggered = false;
-              this.triggerTooltip = '';
+        case 'experiment/apps': {
+          if ( msg.resource.name != this.$route.params.id ) {
+            return;
+          }
 
-              break;
+          switch ( msg.resource.action ) {
+            case 'triggered': {
+              if (msg.result && msg.result.app && msg.result.app === 'soh') {
+                this.sohRunning = true;
+                break;
+              }
+            }
+
+            case 'triggerSuccess': {
+              if (msg.result && msg.result.app && msg.result.app === 'soh') {
+                this.resetNetwork();
+                this.sohRunning = false;
+
+                break;
+              }
+            }
+
+            case 'triggerError': {
+              if (msg.result && msg.result.app && msg.result.app === 'soh') {
+                this.$buefy.toast.open ({
+                  message: 'Triggering State of Health update failed.',
+                  type: 'is-danger',
+                });
+
+                this.sohRunning = false;
+
+                break;
+              }
             }
           }
         }
@@ -471,7 +571,10 @@ export default {
         let resp = await this.$http.get( url );
         let state = await resp.json();
 
-        this.running = state.started;
+        this.running        = state.started;
+        this.sohInitialized = state.soh_initialized;
+        this.sohRunning     = state.soh_running;
+
         this.nodes = state.nodes;
         this.edges = state.edges;
 
@@ -482,6 +585,13 @@ export default {
           )
           this.flows = true;
         } 
+
+        const detailsNode = this.nodes.find(n => n.label === this.detailsModal.vm)
+        if (detailsNode) {
+          this.detailsModal.status = detailsNode.status;
+          this.detailsModal.soh = detailsNode.soh;
+          this.detailsModal.tags = detailsNode.tags;
+        }
       } catch (err) {
         this.errorNotification(err);
       } finally {
@@ -504,7 +614,7 @@ export default {
     updateNodeColor( node ) {
       const colors = {
         "running":    "#4F8F00", // green
-        "notrunning": "#941100", // red
+        "notrunning": "#670b00", // red
         "notboot":    "black",
         "notdeploy":  "#FFD479", // yellow
         "external":   "#005493", // blue
@@ -669,6 +779,7 @@ export default {
         .attr( "fill", this.updateNodeColor )
         .attr( "width", 5 )
         .attr( "height", 5 )
+        .attr("style", (n) => n.image.toLowerCase() == "switch" || !n.tags ? '' : (n.tags[SOH_STYLE_LABEL_KEY] || ''))
         .on( 'mouseenter', this.entered )
         .on( 'mouseleave', this.exited )
         .on( 'click', this.clicked )
@@ -721,7 +832,7 @@ export default {
         .attr( "fill", () => this.updateNodeColor( n ) );
     },
 
-    clicked ( e, n ) {
+    clicked ( _, n ) {
       if ( n.image.toLowerCase() == "switch" ) {
         return;
       }
@@ -733,6 +844,7 @@ export default {
         this.detailsModal.vm = n.label;
         this.detailsModal.status = n.status;
         this.detailsModal.soh = n.soh;
+        this.detailsModal.tags = n.tags;
       }    
     },
 
@@ -881,7 +993,8 @@ export default {
         active: false,
         vm: '',
         status: '',
-        soh: null
+        soh: null,
+        tags: {}
       }
     },
 
@@ -897,6 +1010,85 @@ export default {
 
     vncLoc (vm) {
       return this.$router.resolve({name: 'vnc', params: {id: this.$route.params.id, name: vm, token: this.$store.getters.token}}).href;
+    },
+
+    showTagsModal ( vm, tags ) {
+      const self = this
+      this.$buefy.modal.open({
+        parent:       this,
+        component:    VmLabelsModal,
+        trapFocus:    true,
+        hasModalCard: true,
+        props:        {"vmName": vm, "experiment": this.$route.params.id, "tags": tags},
+        events: {
+          saved() {
+            self.resetNetwork();
+          }
+        }
+      })
+    },
+
+    // STYLE MODAL
+    showStyleModal (vm) {
+      const styleNode = this.nodes.find(n => n.label === this.detailsModal.vm)
+      this.styleModal.vm = vm
+      this.styleModal.baseFill = this.updateNodeColor(styleNode)
+      this.styleModal.baseStroke = this.updateNodeBorder(styleNode)
+      this.styleModal.fill = this.updateNodeColor(styleNode)
+      this.styleModal.stroke = this.updateNodeBorder(styleNode)
+      this.styleModal.strokeStyle = "solid";
+
+      // parse css in label back to values
+      let tempElem = document.createElement("div");
+      tempElem.style = styleNode.tags[SOH_STYLE_LABEL_KEY] || '';
+      if (tempElem.style["fill"] !== '') {
+        this.styleModal.overrideFill = true;
+        this.styleModal.fill = tempElem.style["fill"];
+      }
+      if (tempElem.style["stroke"] !== '') {
+        this.styleModal.overrideStroke = true;
+        this.styleModal.stroke = tempElem.style["stroke"];
+      }
+      if (tempElem.style["stroke-dasharray"] !== '') {
+        this.styleModal.overrideStrokeStyle = true;
+        let dashVal = tempElem.style["stroke-dasharray"]
+        if (dashVal === "0") {
+          this.styleModal.strokeStyle = "solid";
+        }
+        else if (dashVal.startsWith("0,")) {
+          this.styleModal.strokeStyle = "dotted"
+        }
+        else {
+          this.styleModal.strokeStyle = "dashed";
+        }
+      }
+
+      this.styleModal.active = true
+    },
+
+    saveStyle() {
+      let update = { "tag_update_mode": "ADD", "tags": {[SOH_STYLE_LABEL_KEY]: this.styleModalCustomStyle } };
+
+      this.$http.patch('experiments/' + this.$route.params.id + '/vms/' + this.styleModal.vm, update)
+          .then(_ => {
+            this.resetStyleModal()
+            this.resetNetwork()
+          }, err => this.errorNotification(err));
+    },
+
+    resetStyleModal() {
+      this.styleModal = {
+        active: false,
+        vm: '',
+        baseFill: '',
+        baseStroke: '',
+        overrideFill: false,
+        fill: '',
+        overrideStroke: false,
+        stroke: '',
+        overrideStrokeStyle: false,
+        strokeStyle: ''
+      }
     }
   },
 
@@ -907,12 +1099,14 @@ export default {
         this.generateGraph();
         this.generateChord();
       }
-    }
+    },
   },
 
   data() {
     return {
       running: false,
+      sohInitialized: false,
+      sohRunning: false,
       messages: false,
       flows: false,
       nodes: [],
@@ -924,12 +1118,42 @@ export default {
         active: false,
         vm: '',
         status: '',
-        soh: null
+        soh: null,
+        tags: {}
+      },
+      styleModal: {
+        active: false,
+        vm: '',
+        baseFill: '',
+        baseStroke: '',
+        overrideFill: false,
+        fill: '',
+        overrideStroke: false,
+        stroke: '',
+        overrideStrokeStyle: false,
+        strokeStyle: ''
       },
       chordData: null,
-      triggered: false,
-      triggerTooltip: '',
     };
+  },
+  computed: {
+    styleModalCustomStyle: function() {
+      var css = "";
+      if (this.styleModal.overrideFill)
+        css += `fill: ${this.styleModal.fill}; `;
+      if (this.styleModal.overrideStroke)
+        css += `stroke: ${this.styleModal.stroke}; `;
+      if (this.styleModal.overrideStrokeStyle) {
+        if (this.styleModal.strokeStyle == "solid") 
+          css += `stroke-dasharray: 0; `;
+        // these numbers are based on the circles diameter pi * 10
+        else if (this.styleModal.strokeStyle == "dashed")
+          css += `stroke-dasharray: 3 2.236; `;
+        else if (this.styleModal.strokeStyle == "dotted")
+        css += `stroke-dasharray: 0 2.094; stroke-linecap: round; `;
+      }
+      return css;
+    }
   }
 }
 </script>
@@ -945,5 +1169,18 @@ export default {
 
   .modal-card-title {
     color: whitesmoke;
+  }
+
+  li::marker {
+    color: black;
+  }
+
+  .switch {
+    color: gray
+    ;
+  }
+
+  ul {
+    column-count: 1;
   }
 </style>

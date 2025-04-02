@@ -35,8 +35,10 @@
           <b-taglist>
             <b-tag v-for="( a, index ) in createModal.scenarios[ createModal.scenario ]" 
                   :key="index" 
-                  type="is-light">
-              {{ a }}  
+                  type="is-light"
+                  :class="{'is-success': !a.disabled}"
+                  @click="clickScenario(index)">
+              {{ a.name }}
             </b-tag>
           </b-taglist>
           <b-collapse class="card" animation="slide" :open="false">
@@ -50,6 +52,18 @@
             </template>
             <div class="card-content">
               <div class="content">
+                <b-field label="Deployment Mode">
+                  <b-select v-model="createModal.deploy_mode" expanded>
+                    <option v-for="( mode, index ) in ['', 'no-headnode', 'only-headnode', 'all']" :key="index" :value="mode">
+                      {{ mode }}
+                    </option>
+                  </b-select>
+                </b-field>
+                <b-field v-if="bridgeMode!='auto'" label="Default Bridge Name"
+                  :type="createModal.bridgeErrType"
+                  :message="createModal.bridgeErrMsg">
+                  <b-input type="text" v-model="createModal.bridge" />
+                </b-field>
                 <b-field label="VLAN Range">
                   <b-field>
                     <b-numberinput min="0" max="4094" type="is-light" size="is-small" controls-alignment="right" controls-position="compact" placeholder="min" v-model="createModal.vlan_min" />
@@ -261,6 +275,10 @@
         } else {
           return true;
         }
+      },
+
+      bridgeMode () {
+        return this.$store.getters.options['bridge-mode'];
       }
     },
     
@@ -566,7 +584,15 @@
         }
       },
       
-      create () {      
+      create () {
+        var disabledApps = []
+        if (this.createModal.scenario != null){
+          disabledApps = this.createModal.scenarios[this.createModal.scenario].filter(
+            (item) => item.disabled
+          ).map(
+              (item) => item.name)
+        }
+
         const experimentData = {
           name: this.createModal.name,
           topology: this.createModal.topology,
@@ -574,6 +600,9 @@
           vlan_min: +this.createModal.vlan_min,
           vlan_max: +this.createModal.vlan_max,
           workflow_branch: this.createModal.branch,
+          deploy_mode: this.createModal.deploy_mode,
+          disabled_apps: disabledApps,
+          default_bridge: this.createModal.bridge
         }
         
         if ( !this.createModal.name ) {
@@ -624,7 +653,16 @@
           response => {
             response.json().then( state => {
               if ( state.scenarios != null && Object.keys( state.scenarios ).length != 0 ) {
-                this.createModal.scenarios = state.scenarios;
+                let scenarioObj = {}
+                for (const [name, apps] of Object.entries(state.scenarios)) {
+                  let appList = []
+                  for (var appIdx = 0; appIdx < apps.length; appIdx ++){
+                    appList.push({"name": apps[appIdx], "disabled": false})
+                  }
+                  scenarioObj[name] = appList
+                }
+
+                this.createModal.scenarios = scenarioObj;
                 this.createModal.showScenarios = true;
               }
             });
@@ -633,11 +671,17 @@
           }
         );
       },
+      clickScenario (id) {
+        let listOfApps = this.createModal.scenarios[this.createModal.scenario]
+        listOfApps[id].disabled = !listOfApps[id].disabled
+      },
 
       resetCreateModal () {
         this.createModal = {
           active: false,
           name: null,
+          bridgeErrType: null,
+          bridgeErrMsg: null,
           nameErrType: null,
           nameErrMsg: null,
           topology: null,
@@ -645,30 +689,40 @@
           scenarios: {},
           scenario: null,
           vlan_min: null,
-          vlan_max: null
+          vlan_max: null,
+          deploy_mode: null
         }
       },
       
       validate () {
-        if ( !this.createModal.name ) {
+        if (!this.createModal.name) {
           return false;
+        }
+
+        if (this.bridgeMode === "auto") {
+          if (this.createModal.name && this.createModal.name.length > 15) {
+            this.createModal.nameErrType = 'is-danger';
+            this.createModal.nameErrMsg  = 'experiment name must be 15 characters or less when using auto bridge mode';
+            return false;
+          }
         }
 
         for ( let i = 0; i < this.experiments.length; i++ ) {
           if ( this.experiments[i].name == this.createModal.name ) {
             this.createModal.nameErrType = 'is-danger';
             this.createModal.nameErrMsg  = 'experiment with this name already exists';
-            return false
+            return false;
           }
         }
 
         if ( /\s/.test( this.createModal.name ) ) {
           this.createModal.nameErrType = 'is-danger';
           this.createModal.nameErrMsg  = 'experiment names cannot have a space';
-          return false
+          return false;
         } else if ( this.createModal.name == "create" ) {
           this.createModal.nameErrType = 'is-danger';
           this.createModal.nameErrMsg  = 'experiment names cannot be create!';
+          return false;
         } else {
           this.createModal.nameErrType = null;
           this.createModal.nameErrMsg  = null;
@@ -690,12 +744,13 @@
           return false;
         }
 
-        if ( this.createModal.vlan_max < 0 ) {
+        if ( this.createModal.bridge && this.createModal.bridge.length > 15) {
+          this.createModal.bridgeErrType = 'is-danger';
+          this.createModal.bridgeErrMsg  = 'default bridge name must be 15 characters or less';
           return false;
-        }
-
-        if ( this.createModal.vlan_max > 4094 ) {
-          return false;
+        } else {
+          this.createModal.bridgeErrType = null;
+          this.createModal.bridgeErrMsg  = null;
         }
 
         return true;
@@ -732,6 +787,8 @@
         createModal: {
           active: false,
           name: null,
+          bridgeErrType: null,
+          bridgeErrMsg: null,
           nameErrType: null,
           nameErrMsg: null,
           topology: null,
@@ -740,7 +797,9 @@
           scenario: null,
           vlan_min: null,
           vlan_max: null,
-          branch: null
+          branch: null,
+          deploy_mode: null,
+          bridge: null,
         },
         experiments: [],
         topologies: [],

@@ -105,6 +105,21 @@ func (this TopologySpec) FindDelayedNodes() []ifaces.NodeSpec {
 	return nodes
 }
 
+func (this TopologySpec) FindNodesWithVLAN(vlan string) []ifaces.NodeSpec {
+	var nodes []ifaces.NodeSpec
+
+	for _, n := range this.NodesF {
+		for _, i := range n.NetworkF.InterfacesF {
+			if i.VLAN() == vlan {
+				nodes = append(nodes, n)
+				break
+			}
+		}
+	}
+
+	return nodes
+}
+
 func (this *TopologySpec) AddNode(typ, hostname string) ifaces.NodeSpec {
 	n := &Node{
 		TypeF: typ,
@@ -143,7 +158,7 @@ func (this TopologySpec) HasCommands() bool {
 	return false
 }
 
-func (this *TopologySpec) Init() error {
+func (this *TopologySpec) Init(bridge string) error {
 	var errs error
 
 	for _, n := range this.NodesF {
@@ -151,7 +166,7 @@ func (this *TopologySpec) Init() error {
 			errs = multierror.Append(errs, fmt.Errorf("validating node %s: %w", n.GeneralF.HostnameF, err))
 		}
 
-		n.setDefaults()
+		n.setDefaults(bridge)
 	}
 
 	return errs

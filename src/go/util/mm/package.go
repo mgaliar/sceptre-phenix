@@ -52,12 +52,32 @@ func GetVMState(opts ...Option) (string, error) {
 	return DefaultMM.GetVMState(opts...)
 }
 
+func SetVMTags(opts ...Option) error {
+	return DefaultMM.SetVMTags(opts...)
+}
+
 func ConnectVMInterface(opts ...Option) error {
 	return DefaultMM.ConnectVMInterface(opts...)
 }
 
 func DisconnectVMInterface(opts ...Option) error {
 	return DefaultMM.DisconnectVMInterface(opts...)
+}
+
+func CreateBridge(opts ...Option) error {
+	return DefaultMM.CreateBridge(opts...)
+}
+
+func CreateTunnel(opts ...Option) error {
+	return DefaultMM.CreateTunnel(opts...)
+}
+
+func GetTunnels(opts ...Option) []map[string]string {
+	return DefaultMM.GetTunnels(opts...)
+}
+
+func CloseTunnel(opts ...Option) error {
+	return DefaultMM.CloseTunnel(opts...)
 }
 
 func StartVMCapture(opts ...Option) error {
@@ -80,12 +100,20 @@ func GetClusterHosts(schedOnly bool) (Hosts, error) {
 	return DefaultMM.GetClusterHosts(schedOnly)
 }
 
+func GetNamespaceHosts(ns string) (Hosts, error) {
+	return DefaultMM.GetNamespaceHosts(ns)
+}
+
 func Headnode() string {
 	return DefaultMM.Headnode()
 }
 
 func IsHeadnode(node string) bool {
 	return DefaultMM.IsHeadnode(node)
+}
+
+func GetMMArgs() (map[string]string, error) {
+	return DefaultMM.GetMMArgs()
 }
 
 func GetVLANs(opts ...Option) (map[string]int, error) {
@@ -118,6 +146,10 @@ func TapVLAN(opts ...TapOption) error {
 
 func MeshShell(host, cmd string) error {
 	return DefaultMM.MeshShell(host, cmd)
+}
+
+func MeshShellResponse(host, cmd string) (string, error) {
+	return DefaultMM.MeshShellResponse(host, cmd)
 }
 
 func MeshSend(ns, host, command string) error {

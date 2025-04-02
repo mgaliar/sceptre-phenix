@@ -122,21 +122,27 @@ type Cluster struct {
 }
 
 type Host struct {
-	Name        string   `json:"name"`
-	CPUs        int      `json:"cpus"`
-	CPUCommit   int      `json:"cpucommit"`
-	Load        []string `json:"load"`
-	MemUsed     int      `json:"memused"`
-	MemTotal    int      `json:"memtotal"`
-	MemCommit   int      `json:"memcommit"`
-	Tx          float64  `json:"tx"`
-	Rx          float64  `json:"rx"`
-	Bandwidth   string   `json:"bandwidth"`
-	NetCommit   int      `json:"netcommit"`
-	VMs         int      `json:"vms"`
-	Uptime      float64  `json:"uptime"`
-	Schedulable bool     `json:"schedulable"`
-	Headnode    bool     `json:"headnode"`
+	Name        string    `json:"name"`
+	CPUs        int       `json:"cpus"`
+	CPUCommit   int       `json:"cpucommit"`
+	Load        []string  `json:"load"`
+	MemUsed     int       `json:"memused"`
+	MemTotal    int       `json:"memtotal"`
+	MemCommit   int       `json:"memcommit"`
+	Tx          float64   `json:"tx"`
+	Rx          float64   `json:"rx"`
+	Bandwidth   string    `json:"bandwidth"`
+	DiskUsage   DiskUsage `json:"diskusage"`
+	NetCommit   int       `json:"netcommit"`
+	VMs         int       `json:"vms"`
+	Uptime      float64   `json:"uptime"`
+	Schedulable bool      `json:"schedulable"`
+	Headnode    bool      `json:"headnode"`
+}
+
+type DiskUsage struct {
+	Phenix   float64 `json:"diskphenix"`
+	Minimega float64 `json:"diskminimega"`
 }
 
 type VMs []VM
@@ -200,24 +206,30 @@ func (this VMs) Paginate(page, size int) VMs {
 }
 
 type VM struct {
-	ID         int       `json:"id"`
-	Name       string    `json:"name"`
-	Experiment string    `json:"experiment"`
-	Host       string    `json:"host"`
-	IPv4       []string  `json:"ipv4"`
-	CPUs       int       `json:"cpus"`
-	RAM        int       `json:"ram"`
-	Disk       string    `json:"disk"`
-	DoNotBoot  bool      `json:"dnb"`
-	Networks   []string  `json:"networks"`
-	Taps       []string  `json:"taps"`
-	Captures   []Capture `json:"captures"`
-	Running    bool      `json:"running"`
-	Busy       bool      `json:"busy"`
-	CCActive   bool      `json:"ccActive"`
-	Uptime     float64   `json:"uptime"`
-	Screenshot string    `json:"screenshot,omitempty"`
-	Tags       []string  `json:"tags"`
+	ID              int               `json:"id"`
+	Name            string            `json:"name"`
+	Type            string            `json:"type"`
+	Experiment      string            `json:"experiment"`
+	Host            string            `json:"host"`
+	IPv4            []string          `json:"ipv4"`
+	CPUs            int               `json:"cpus"`
+	RAM             int               `json:"ram"`
+	Disk            string            `json:"disk"`
+	InjectPartition int               `json:"inject_partition"`
+	OSType          string            `json:"osType"`
+	DoNotBoot       bool              `json:"dnb"`
+	Networks        []string          `json:"networks"`
+	Taps            []string          `json:"taps"`
+	Captures        []Capture         `json:"captures"`
+	State           string            `json:"state"`
+	Running         bool              `json:"running"`
+	Busy            bool              `json:"busy"`
+	CCActive        bool              `json:"ccActive"`
+	Uptime          float64           `json:"uptime"`
+	Screenshot      string            `json:"screenshot,omitempty"`
+	CdRom           string            `json:"cdRom"`
+	Tags            map[string]string `json:"tags"`
+	Snapshot        bool              `json:"snapshot"`
 
 	// Used internally to track network <--> IP relationship, since
 	// network ordering from minimega may not be the same as network
@@ -225,17 +237,38 @@ type VM struct {
 	Interfaces map[string]string `json:"-"`
 
 	// Used internally for showing VM details.
-	Type        string                 `json:"-"`
-	OSType      string                 `json:"-"`
 	Metadata    map[string]interface{} `json:"-"`
 	Labels      map[string]string      `json:"-"`
 	Annotations map[string]interface{} `json:"-"`
 
-	// Used internally to track state of VM in minimega.
-	State string `json:"-"`
-
 	// Used internally to check for active CC agent.
 	UUID string `json:"-"`
+}
+
+// Copy returns a deep copy of the VM. It only makes deep copies of fields that
+// are exported as JSON.
+func (this VM) Copy() VM {
+	vm := this
+
+	vm.IPv4 = make([]string, len(this.IPv4))
+	copy(vm.IPv4, this.IPv4)
+
+	vm.Networks = make([]string, len(this.Networks))
+	copy(vm.Networks, this.Networks)
+
+	vm.Taps = make([]string, len(this.Taps))
+	copy(vm.Taps, this.Taps)
+
+	// This works because the Capture struct is only made up of primatives.
+	vm.Captures = make([]Capture, len(this.Captures))
+	copy(vm.Captures, this.Captures)
+
+	vm.Tags = make(map[string]string, len(this.Tags))
+	for k, v := range this.Tags {
+		vm.Tags[k] = v
+	}
+
+	return vm
 }
 
 type Captures struct {

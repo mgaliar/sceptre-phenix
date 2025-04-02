@@ -8,11 +8,15 @@ export default new Vuex.Store({
   state: {
     username: localStorage.getItem( 'phenix.user' ),
     token:    localStorage.getItem( 'phenix.token' ),
-    role:     localStorage.getItem( 'phenix.role' ),
+    role:     JSON.parse(localStorage.getItem( 'phenix.role' )),
     auth:     localStorage.getItem( 'phenix.auth' ) === 'true',
     next:     null,
 
     features: [],
+    options:  {},
+    logs:     [],
+
+    logs_max: 5000,
   },
 
   mutations: {
@@ -25,13 +29,13 @@ export default new Vuex.Store({
       if ( remember ) {
         localStorage.setItem( 'phenix.user',  state.username );
         localStorage.setItem( 'phenix.token', state.token );
-        localStorage.setItem( 'phenix.role',  state.role );
+        localStorage.setItem( 'phenix.role',  JSON.stringify(state.role) );
         localStorage.setItem( 'phenix.auth',  state.auth );
       }
 
-      if ( state.role === "VM Viewer" ) {
+      if ( state.role.name === "VM Viewer" ) {
         router.replace( {name: 'vmtiles'} );
-      } else if ( state.role === "Disabled" ) {
+      } else if ( state.role.name === "Disabled" ) {
         router.replace( {name: 'disabled'} );
       } else if ( state.next && state.next.name !== 'signin' ) {
         router.replace( state.next );
@@ -62,6 +66,30 @@ export default new Vuex.Store({
 
     'FEATURES' ( state, features ) {
       state.features = features;
+    },
+
+    'OPTIONS' ( state, options ) {
+      state.options = options;
+    },
+
+    'LOG' ( state, log ) {
+      let count = state.logs.unshift(log);
+
+      if ( count > state.logs_max ) {
+        state.logs.length = state.logs_max;
+      }
+    },
+
+    'LOGS' ( state, logs ) {
+      let count = state.logs.unshift(...logs.reverse());
+
+      if ( count > state.logs_max ) {
+        state.logs.length = state.logs_max;
+      }
+    },
+
+    'MAX_LOGS' ( state, max ) {
+      state.logs_max = max;
     }
   },
   
@@ -84,6 +112,14 @@ export default new Vuex.Store({
 
     features: state => {
       return state.features;
+    },
+
+    options: state => {
+      return state.options;
+    },
+
+    logs: state => {
+      return state.logs.toReversed();
     }
   }
 });

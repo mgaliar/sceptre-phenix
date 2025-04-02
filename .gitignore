@@ -5,3 +5,7 @@
 .vscode
 
 bin
+
+staticcheck.conf
+
+.venv

@@ -59,9 +59,9 @@ func (this *Tap) PostStart(ctx context.Context, exp *types.Experiment) error {
 		return fmt.Errorf("decoding %s app metadata: %w", this.Name(), err)
 	}
 
-	hosts, err := mm.GetClusterHosts(true)
+	hosts, err := mm.GetNamespaceHosts(exp.Metadata.Name)
 	if err != nil {
-		return fmt.Errorf("getting list of cluster hosts: %w", err)
+		return fmt.Errorf("getting list of experiment hosts: %w", err)
 	}
 
 	rand.Seed(time.Now().UnixNano())
@@ -74,20 +74,31 @@ func (this *Tap) PostStart(ctx context.Context, exp *types.Experiment) error {
 
 	status := TapAppStatus{Host: host}
 
-	// TODO: prepopulate `pairs` with taps from other experiments
-
 	for _, t := range amd.Taps {
 		if slices.Contains(vlans, t.VLAN) {
 			return fmt.Errorf("tap already created for VLAN %s", t.VLAN)
 		}
 
-		t.Init(tap.Experiment(exp.Metadata.Name), tap.UsedPairs(pairs))
+		opts := []tap.Option{tap.Experiment(exp.Metadata.Name), tap.UsedPairs(pairs)}
+
+		if subnet, err := netaddr.ParseIPPrefix(t.Subnet); err == nil {
+			opts = append(opts, tap.PairSubnet(subnet))
+		}
+
+		t.Init(exp.Spec.DefaultBridge(), opts...)
 
 		// Tap name is random, yet descriptive to the fact that it's a "tapapp" tap.
 		t.Name = fmt.Sprintf("%s-tapapp", util.RandomString(8))
 
-		if err := t.Create(host); err != nil {
+		pair, err := t.Create(host)
+		if err != nil {
 			return fmt.Errorf("creating host tap for VLAN %s: %w", t.VLAN, err)
+		}
+
+		if !pair.IsZero() {
+			// Include pair just created for this tap to list of used pairs in case
+			// more than one tap is being created for this experiment.
+			pairs = append(pairs, pair)
 		}
 
 		status.Taps = append(status.Taps, t)
@@ -115,7 +126,7 @@ func (this *Tap) Cleanup(ctx context.Context, exp *types.Experiment) error {
 	)
 
 	for _, t := range status.Taps {
-		t.Init(tap.Experiment(exp.Metadata.Name))
+		t.Init(exp.Spec.DefaultBridge(), tap.Experiment(exp.Metadata.Name))
 
 		if err := t.Delete(host); err != nil {
 			errs = multierror.Append(errs, fmt.Errorf("deleting host tap for VLAN %s: %w", t.VLAN, err))
@@ -128,7 +139,7 @@ func (this *Tap) Cleanup(ctx context.Context, exp *types.Experiment) error {
 func (this Tap) discoverUsedPairs() []netaddr.IPPrefix {
 	var pairs []netaddr.IPPrefix
 
-	running, err := types.RunningExperiments()
+	running, err := types.Experiments(true)
 	if err != nil {
 		return nil
 	}

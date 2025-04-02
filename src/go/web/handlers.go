@@ -1,7 +1,6 @@
 package web
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -9,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,9 +26,11 @@ import (
 	"phenix/api/vm"
 	"phenix/app"
 	"phenix/store"
-	putil "phenix/util"
+	"phenix/util/common"
 	"phenix/util/mm"
 	"phenix/util/notes"
+	"phenix/util/plog"
+	"phenix/util/pubsub"
 	"phenix/web/broker"
 	"phenix/web/cache"
 	"phenix/web/proto"
@@ -38,12 +38,12 @@ import (
 	"phenix/web/util"
 	"phenix/web/weberror"
 
-	log "github.com/activeshadow/libminimega/minilog"
+	putil "phenix/util"
+	bt "phenix/web/broker/brokertypes"
+
 	"github.com/creack/pty"
-	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
 	"golang.org/x/net/websocket"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -58,7 +58,7 @@ var (
 
 // GET /experiments
 func GetExperiments(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetExperiments HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetExperiments")
 
 	var (
 		ctx   = r.Context()
@@ -68,14 +68,14 @@ func GetExperiments(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments", "list") {
-		log.Warn("listing experiments not allowed for %s", ctx.Value("user").(string))
+		plog.Warn("listing experiments not allowed", "user", ctx.Value("user").(string))
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	experiments, err := experiment.List()
 	if err != nil {
-		log.Error("getting experiments - %v", err)
+		plog.Error("getting experiments", "err", err)
 	}
 
 	allowed := []*proto.Experiment{}
@@ -112,7 +112,7 @@ func GetExperiments(w http.ResponseWriter, r *http.Request) {
 
 				screenshot, err := util.GetScreenshot(exp.Spec.ExperimentName(), v.Name, size)
 				if err != nil {
-					log.Error("getting screenshot - %v", err)
+					plog.Error("getting screenshot", "err", err)
 					continue
 				}
 
@@ -127,7 +127,7 @@ func GetExperiments(w http.ResponseWriter, r *http.Request) {
 
 	body, err := marshaler.Marshal(&proto.ExperimentList{Experiments: allowed})
 	if err != nil {
-		log.Error("marshaling experiments - %v", err)
+		plog.Error("marshaling experiments", "err", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
@@ -137,7 +137,7 @@ func GetExperiments(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments
 func CreateExperiment(w http.ResponseWriter, r *http.Request) {
-	log.Debug("CreateExperiment HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "CreateExperiment")
 
 	var (
 		ctx  = r.Context()
@@ -145,32 +145,38 @@ func CreateExperiment(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments", "create") {
-		log.Warn("creating experiments not allowed for %s", ctx.Value("user").(string))
+		plog.Warn("creating experiments not allowed", "user", ctx.Value("user").(string))
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Error("reading request body - %v", err)
+		plog.Error("reading request body", "err", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
 	var req proto.CreateExperimentRequest
 	if err := unmarshaler.Unmarshal(body, &req); err != nil {
-		log.Error("unmashaling request body - %v", err)
+		plog.Error("unmashaling request body", "err", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
 	if err := cache.LockExperimentForCreation(req.Name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking experiment", "exp", req.Name, "action", "creation", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 
 	defer cache.UnlockExperiment(req.Name)
+
+	deployMode, err := common.ParseDeployMode(req.DeployMode)
+	if err != nil {
+		plog.Warn("error parsing experiment deploy mode ('%s') - using default of '%s'", req.DeployMode, common.DeployMode)
+		deployMode = common.DeployMode
+	}
 
 	opts := []experiment.CreateOption{
 		experiment.CreateWithName(req.Name),
@@ -178,6 +184,10 @@ func CreateExperiment(w http.ResponseWriter, r *http.Request) {
 		experiment.CreateWithScenario(req.Scenario),
 		experiment.CreateWithVLANMin(int(req.VlanMin)),
 		experiment.CreateWithVLANMax(int(req.VlanMax)),
+		experiment.CreatedWithDisabledApplications(req.DisabledApps),
+		experiment.CreateWithDeployMode(deployMode),
+		experiment.CreateWithDefaultBridge(req.DefaultBridge),
+		experiment.CreateWithGREMesh(req.UseGreMesh),
 	}
 
 	if req.WorkflowBranch != "" {
@@ -186,40 +196,41 @@ func CreateExperiment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := experiment.Create(ctx, opts...); err != nil {
-		log.Error("creating experiment %s - %v", req.Name, err)
+		plog.Error("creating experiment", "exp", req.Name, "err", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	if warns := notes.Warnings(ctx, true); warns != nil {
 		for _, warn := range warns {
-			log.Warn("%v", warn)
+			plog.Warn("creating experiment", "warnings", warn)
 		}
 	}
 
 	exp, err := experiment.Get(req.Name)
 	if err != nil {
-		log.Error("getting experiment %s - %v", req.Name, err)
+		plog.Error("getting experiment", "exp", req.Name, "err", err)
 		http.Error(w, "", http.StatusInternalServerError)
 		return
 	}
 
 	vms, err := vm.List(req.Name)
 	if err != nil {
-		// TODO
-		log.Error("listing VMs in experiment %s - %v", req.Name, err)
+		plog.Error("listing experiment VMs", "exp", req.Name, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	body, err = marshaler.Marshal(util.ExperimentToProtobuf(*exp, "", vms))
 	if err != nil {
-		log.Error("marshaling experiment %s - %v", req.Name, err)
+		plog.Error("marshaling experiment", "err", req.Name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("experiments", "get", req.Name),
-		broker.NewResource("experiment", req.Name, "create"),
+		bt.NewRequestPolicy("experiments", "get", req.Name),
+		bt.NewResource("experiment", req.Name, "create"),
 		body,
 	)
 
@@ -228,7 +239,7 @@ func CreateExperiment(w http.ResponseWriter, r *http.Request) {
 
 // PUT /experiments/{name}
 func UpdateExperiment(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("UpdateExperiment HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "UpdateExperiment")
 
 	var (
 		ctx  = r.Context()
@@ -253,7 +264,7 @@ func UpdateExperiment(w http.ResponseWriter, r *http.Request) error {
 		return err.SetStatus(http.StatusBadRequest)
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		err := weberror.NewWebError(err, "unable to parse update request for experiment %s", name)
 		return err.SetStatus(http.StatusInternalServerError)
@@ -288,7 +299,7 @@ func UpdateExperiment(w http.ResponseWriter, r *http.Request) error {
 
 // GET /experiments/{name}
 func GetExperiment(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("GetExperiment HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetExperiment")
 
 	var (
 		ctx          = r.Context()
@@ -352,7 +363,7 @@ func GetExperiment(w http.ResponseWriter, r *http.Request) error {
 			if vm.Running && size != "" {
 				screenshot, err := util.GetScreenshot(name, vm.Name, size)
 				if err != nil {
-					log.Error("getting screenshot: %v", err)
+					plog.Error("getting screenshot", "err", err)
 				} else {
 					vm.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 				}
@@ -390,7 +401,7 @@ func GetExperiment(w http.ResponseWriter, r *http.Request) error {
 
 // DELETE /experiments/{name}
 func DeleteExperiment(w http.ResponseWriter, r *http.Request) {
-	log.Debug("DeleteExperiment HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "DeleteExperiment")
 
 	var (
 		ctx  = r.Context()
@@ -400,13 +411,13 @@ func DeleteExperiment(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments", "delete", name) {
-		log.Warn("deleting experiment %s not allowed for %s", name, ctx.Value("user").(string))
+		plog.Warn("deleting experiment not allowed", "user", ctx.Value("user").(string), "exp", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	if err := cache.LockExperimentForDeletion(name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking experiment", "exp", name, "action", "deletion", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -414,14 +425,14 @@ func DeleteExperiment(w http.ResponseWriter, r *http.Request) {
 	defer cache.UnlockExperiment(name)
 
 	if err := experiment.Delete(name); err != nil {
-		log.Error("deleting experiment %s - %v", name, err)
+		plog.Error("deleting experiment", "exp", name, "err", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("experiments", "delete", name),
-		broker.NewResource("experiment", name, "delete"),
+		bt.NewRequestPolicy("experiments", "delete", name),
+		bt.NewResource("experiment", name, "delete"),
 		nil,
 	)
 
@@ -430,7 +441,7 @@ func DeleteExperiment(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{name}/start
 func StartExperiment(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("StartExperiment HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "StartExperiment")
 
 	var (
 		ctx  = r.Context()
@@ -455,7 +466,7 @@ func StartExperiment(w http.ResponseWriter, r *http.Request) error {
 
 // POST /experiments/{name}/stop
 func StopExperiment(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("StopExperiment HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "StopExperiment")
 
 	var (
 		ctx  = r.Context()
@@ -480,7 +491,7 @@ func StopExperiment(w http.ResponseWriter, r *http.Request) error {
 
 // POST /experiments/{name}/trigger[?apps=<foo,bar,baz>]
 func TriggerExperimentApps(w http.ResponseWriter, r *http.Request) {
-	log.Debug("TriggerExperimentApps HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "TriggerExperimentApps")
 
 	var (
 		ctx  = r.Context()
@@ -493,26 +504,32 @@ func TriggerExperimentApps(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments/trigger", "create", name) {
-		log.Warn("triggering experiment %s apps not allowed for %s", name, ctx.Value("user").(string))
+		plog.Warn("triggering experiment apps not allowed", "user", ctx.Value("user").(string), "exp", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	broker.Broadcast(
-		broker.NewRequestPolicy("experiments/trigger", "create", name),
-		broker.NewResource("experiment/apps", name, "triggered"),
-		nil,
-	)
-
 	go func() {
-		apps := strings.Split(appsFilter, ",")
+		var (
+			md   = make(map[string]any)
+			apps = strings.Split(appsFilter, ",")
+		)
+
+		for k, v := range query {
+			md[k] = v
+		}
 
 		for _, a := range apps {
+			pubsub.Publish("trigger-app", app.TriggerPublication{
+				Experiment: name, App: a, State: "start",
+			})
+
 			k := fmt.Sprintf("%s/%s", name, a)
 
 			// We don't want to use the HTTP request's context here.
 			ctx, cancel := context.WithCancel(context.Background())
 			ctx = app.SetContextTriggerUI(ctx)
+			ctx = app.SetContextMetadata(ctx, md)
 			cancelers[k] = append(cancelers[k], cancel)
 
 			if err := experiment.TriggerRunning(ctx, name, a); err != nil {
@@ -520,23 +537,18 @@ func TriggerExperimentApps(w http.ResponseWriter, r *http.Request) {
 				delete(cancelers, k)
 
 				humanized := putil.HumanizeError(err, "Unable to trigger running stage for %s app in %s experiment", a, name)
+				pubsub.Publish("trigger-app", app.TriggerPublication{
+					Experiment: name, App: a, State: "error", Error: humanized,
+				})
 
-				broker.Broadcast(
-					broker.NewRequestPolicy("experiments/trigger", "create", name),
-					broker.NewResource("experiment/apps", name, "triggerError"),
-					[]byte(humanized.Humanize()),
-				)
-
-				log.Error("triggering experiment %s app %s - %v", name, a, err)
+				plog.Error("triggering experiment app", "exp", name, "app", a, "err", err)
 				return
 			}
-		}
 
-		broker.Broadcast(
-			broker.NewRequestPolicy("experiments/trigger", "create", name),
-			broker.NewResource("experiment/apps", name, "triggerSuccess"),
-			notes.ToJSON(ctx),
-		)
+			pubsub.Publish("trigger-app", app.TriggerPublication{
+				Experiment: name, App: a, State: "success",
+			})
+		}
 	}()
 
 	w.WriteHeader(http.StatusNoContent)
@@ -544,7 +556,7 @@ func TriggerExperimentApps(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /experiments/{name}/trigger[?apps=<foo,bar,baz>]
 func CancelTriggeredExperimentApps(w http.ResponseWriter, r *http.Request) {
-	log.Debug("CancelTriggeredExperimentApps HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "CancelTriggeredExperimentApps")
 
 	var (
 		ctx  = r.Context()
@@ -557,16 +569,10 @@ func CancelTriggeredExperimentApps(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments/trigger", "delete", name) {
-		log.Warn("canceling triggered experiment %s apps not allowed for %s", name, ctx.Value("user").(string))
+		plog.Warn("canceling triggered experiment apps not allowed", "user", ctx.Value("user").(string), "exp", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-
-	broker.Broadcast(
-		broker.NewRequestPolicy("experiments/trigger", "delete", name),
-		broker.NewResource("experiment/apps", name, "cancelTrigger"),
-		nil,
-	)
 
 	go func() {
 		apps := strings.Split(appsFilter, ",")
@@ -581,13 +587,11 @@ func CancelTriggeredExperimentApps(w http.ResponseWriter, r *http.Request) {
 			}
 
 			delete(cancelers, k)
-		}
 
-		broker.Broadcast(
-			broker.NewRequestPolicy("experiments/trigger", "delete", name),
-			broker.NewResource("experiment/apps", name, "cancelTriggerSuccess"),
-			notes.ToJSON(ctx),
-		)
+			pubsub.Publish("trigger-app", app.TriggerPublication{
+				Experiment: name, Verb: "delete", App: a, State: "success",
+			})
+		}
 	}()
 
 	w.WriteHeader(http.StatusNoContent)
@@ -595,7 +599,7 @@ func CancelTriggeredExperimentApps(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{name}/schedule
 func GetExperimentSchedule(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetExperimentSchedule HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetExperimentSchedule")
 
 	var (
 		ctx  = r.Context()
@@ -605,30 +609,28 @@ func GetExperimentSchedule(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments/schedule", "get", name) {
-		log.Warn("getting experiment schedule for %s not allowed for %s", name, ctx.Value("user").(string))
+		plog.Warn("getting experiment schedule not allowed", "user", ctx.Value("user").(string), "exp", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	if status := cache.IsExperimentLocked(name); status != "" {
-		msg := fmt.Sprintf("experiment %s is cache.Locked with status %s", name, status)
-
-		log.Warn(msg)
-		http.Error(w, msg, http.StatusConflict)
+		plog.Warn("experiment locked", "exp", name, "status", status)
+		http.Error(w, fmt.Sprintf("experiment %s is cache.Locked with status %s", name, status), http.StatusConflict)
 
 		return
 	}
 
 	exp, err := experiment.Get(name)
 	if err != nil {
-		log.Error("getting experiment %s - %v", name, err)
+		plog.Error("getting experiment", "exp", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	body, err := marshaler.Marshal(util.ExperimentScheduleToProtobuf(*exp))
 	if err != nil {
-		log.Error("marshaling schedule for experiment %s - %v", name, err)
+		plog.Error("marshaling schedule for experiment", "exp", name, "err", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
@@ -638,7 +640,7 @@ func GetExperimentSchedule(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{name}/schedule
 func ScheduleExperiment(w http.ResponseWriter, r *http.Request) {
-	log.Debug("ScheduleExperiment HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "ScheduleExperiment")
 
 	var (
 		ctx  = r.Context()
@@ -648,23 +650,21 @@ func ScheduleExperiment(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments/schedule", "create", name) {
-		log.Warn("creating experiment schedule for %s not allowed for %s", name, ctx.Value("user").(string))
+		plog.Warn("creating experiment schedule not allowed", "user", ctx.Value("user").(string), "exp", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	if status := cache.IsExperimentLocked(name); status != "" {
-		msg := fmt.Sprintf("experiment %s is cache.Locked with status %s", name, status)
-
-		log.Warn(msg)
-		http.Error(w, msg, http.StatusConflict)
+		plog.Warn("experiment locked", "exp", name, "status", status)
+		http.Error(w, fmt.Sprintf("experiment %s is cache.Locked with status %s", name, status), http.StatusConflict)
 
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Error("reading request body - %v", err)
+		plog.Error("reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -672,35 +672,35 @@ func ScheduleExperiment(w http.ResponseWriter, r *http.Request) {
 	var req proto.UpdateScheduleRequest
 	err = unmarshaler.Unmarshal(body, &req)
 	if err != nil {
-		log.Error("unmarshaling request body - %v", err)
+		plog.Error("unmarshaling request body", "err", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	err = experiment.Schedule(experiment.ScheduleForName(name), experiment.ScheduleWithAlgorithm(req.Algorithm))
 	if err != nil {
-		log.Error("scheduling experiment %s using %s - %v", name, req.Algorithm, err)
+		plog.Error("scheduling experiment", "exp", name, "algorithm", req.Algorithm, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	exp, err := experiment.Get(name)
 	if err != nil {
-		log.Error("getting experiment %s - %v", name, err)
+		plog.Error("getting experiment", "exp", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	body, err = marshaler.Marshal(util.ExperimentScheduleToProtobuf(*exp))
 	if err != nil {
-		log.Error("marshaling schedule for experiment %s - %v", name, err)
+		plog.Error("marshaling schedule for experiment", "exp", name, "err", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("experiments/schedule", "create", name),
-		broker.NewResource("experiment", name, "schedule"),
+		bt.NewRequestPolicy("experiments/schedule", "create", name),
+		bt.NewResource("experiment", name, "schedule"),
 		body,
 	)
 
@@ -709,7 +709,7 @@ func ScheduleExperiment(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{name}/captures
 func GetExperimentCaptures(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetExperimentCaptures HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetExperimentCaptures")
 
 	var (
 		ctx  = r.Context()
@@ -719,7 +719,7 @@ func GetExperimentCaptures(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments/captures", "list", name) {
-		log.Warn("listing experiment captures for %s not allowed for %s", name, ctx.Value("user").(string))
+		plog.Warn("listing experiment captures not allowed", "user", ctx.Value("user").(string), "exp", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -737,7 +737,7 @@ func GetExperimentCaptures(w http.ResponseWriter, r *http.Request) {
 
 	body, err := marshaler.Marshal(&proto.CaptureList{Captures: util.CapturesToProtobuf(allowed)})
 	if err != nil {
-		log.Error("marshaling captures for experiment %s - %v", name, err)
+		plog.Error("marshaling captures for experiment", "exp", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -747,7 +747,7 @@ func GetExperimentCaptures(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{name}/files
 func GetExperimentFiles(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetExperimentFiles HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetExperimentFiles")
 
 	var (
 		ctx          = r.Context()
@@ -763,14 +763,14 @@ func GetExperimentFiles(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments/files", "list", name) {
-		log.Warn("listing experiment files for %s not allowed for %s", name, ctx.Value("user").(string))
+		plog.Warn("listing experiment files not allowed", "user", ctx.Value("user").(string), "exp", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	files, err := experiment.Files(name, clientFilter)
 	if err != nil {
-		log.Error("getting list of files for experiment %s - %v", name, err)
+		plog.Error("getting list of files for experiment", "exp", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -788,7 +788,7 @@ func GetExperimentFiles(w http.ResponseWriter, r *http.Request) {
 
 	body, err := json.Marshal(util.WithRoot("files", files))
 	if err != nil {
-		log.Error("marshaling file list for experiment %s - %v", name, err)
+		plog.Error("marshaling file list for experiment", "exp", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -798,7 +798,7 @@ func GetExperimentFiles(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{name}/files/{filename}
 func GetExperimentFile(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetExperimentFile HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetExperimentFile")
 
 	var (
 		ctx   = r.Context()
@@ -811,7 +811,7 @@ func GetExperimentFile(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("experiments/files", "get", name) {
-		log.Warn("getting experiment file for %s not allowed for %s", name, ctx.Value("user").(string))
+		plog.Warn("getting experiment file not allowed", "user", ctx.Value("user").(string), "exp", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -823,7 +823,7 @@ func GetExperimentFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Error("getting file %s for experiment %s - %v", path, name, err)
+		plog.Error("getting file for experiment", "exp", name, "file", path, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -840,7 +840,7 @@ func GetExperimentFile(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{name}/apps
 func GetExperimentApps(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("GetExperimentApps HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetExperimentApps")
 
 	var (
 		ctx  = r.Context()
@@ -878,7 +878,7 @@ func GetExperimentApps(w http.ResponseWriter, r *http.Request) error {
 
 // GET /experiments/{exp}/vms
 func GetVMs(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetVMs HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetVMs")
 
 	var (
 		ctx     = r.Context()
@@ -917,7 +917,7 @@ func GetVMs(w http.ResponseWriter, r *http.Request) {
 			if vm.Running && size != "" {
 				screenshot, err := util.GetScreenshot(expName, vm.Name, size)
 				if err != nil {
-					log.Error("getting screenshot: %v", err)
+					plog.Error("getting screenshot", "err", err)
 				} else {
 					vm.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 				}
@@ -956,7 +956,7 @@ func GetVMs(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{exp}/vms/{name}
 func GetVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetVM")
 
 	var (
 		ctx     = r.Context()
@@ -988,7 +988,7 @@ func GetVM(w http.ResponseWriter, r *http.Request) {
 	if vm.Running && size != "" {
 		screenshot, err := util.GetScreenshot(expName, name, size)
 		if err != nil {
-			log.Error("getting screenshot: %v", err)
+			plog.Error("getting screenshot", "err", err)
 		} else {
 			vm.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 		}
@@ -1005,7 +1005,8 @@ func GetVM(w http.ResponseWriter, r *http.Request) {
 
 // PATCH /experiments/{exp}/vms/{name}
 func UpdateVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("UpdateVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "UpdateVM")
+
 	var (
 		ctx     = r.Context()
 		role    = ctx.Value("role").(rbac.Role)
@@ -1019,7 +1020,7 @@ func UpdateVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1037,10 +1038,17 @@ func UpdateVM(w http.ResponseWriter, r *http.Request) {
 		vm.UpdateWithCPU(int(req.Cpus)),
 		vm.UpdateWithMem(int(req.Ram)),
 		vm.UpdateWithDisk(req.Disk),
+		vm.UpdateWithPartition(int(req.InjectPartition)),
 	}
 
 	if req.Interface != nil {
 		opts = append(opts, vm.UpdateWithInterface(int(req.Interface.Index), req.Interface.Vlan))
+	}
+
+	if req.TagUpdateMode == proto.TagUpdateMode_SET {
+		opts = append(opts, vm.UpdateWithTags(req.Tags, false))
+	} else if req.TagUpdateMode == proto.TagUpdateMode_ADD {
+		opts = append(opts, vm.UpdateWithTags(req.Tags, true))
 	}
 
 	switch req.Boot.(type) {
@@ -1052,9 +1060,14 @@ func UpdateVM(w http.ResponseWriter, r *http.Request) {
 	case *proto.UpdateVMRequest_Host:
 		opts = append(opts, vm.UpdateWithHost(req.GetHost()))
 	}
+	
+	switch req.SnapshotOption.(type) {
+	case *proto.UpdateVMRequest_Snapshot:
+		opts = append(opts, vm.UpdateWithSnapshot(req.GetSnapshot()))
+	}
 
 	if err := vm.Update(opts...); err != nil {
-		log.Error("updating VM: %v", err)
+		plog.Error("updating VM", "err", err)
 		http.Error(w, "unable to update VM", http.StatusInternalServerError)
 		return
 	}
@@ -1074,7 +1087,7 @@ func UpdateVM(w http.ResponseWriter, r *http.Request) {
 	if vm.Running {
 		screenshot, err := util.GetScreenshot(expName, name, "215")
 		if err != nil {
-			log.Error("getting screenshot: %v", err)
+			plog.Error("getting screenshot", "err", err)
 		} else {
 			vm.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 		}
@@ -1087,8 +1100,8 @@ func UpdateVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms", "patch", fmt.Sprintf("%s/%s", expName, name)),
-		broker.NewResource("experiment/vm", fmt.Sprintf("%s/%s", expName, name), "update"),
+		bt.NewRequestPolicy("vms", "patch", fmt.Sprintf("%s/%s", expName, name)),
+		bt.NewResource("experiment/vm", fmt.Sprintf("%s/%s", expName, name), "update"),
 		body,
 	)
 
@@ -1097,7 +1110,8 @@ func UpdateVM(w http.ResponseWriter, r *http.Request) {
 
 // PATCH /experiments/{exp}/vms
 func UpdateVMs(w http.ResponseWriter, r *http.Request) {
-	log.Debug("UpdateVMs HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "UpdateVMs")
+
 	var (
 		ctx     = r.Context()
 		role    = ctx.Value("role").(rbac.Role)
@@ -1105,7 +1119,7 @@ func UpdateVMs(w http.ResponseWriter, r *http.Request) {
 		expName = vars["exp"]
 	)
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1121,10 +1135,9 @@ func UpdateVMs(w http.ResponseWriter, r *http.Request) {
 	resp.Vms = make([]*proto.VM, int(req.Total))
 
 	for index, vmRequest := range req.Vms {
-
 		// Skip any vms that are not allowed to be updated
 		if !role.Allowed("vms", "patch", fmt.Sprintf("%s/%s", expName, vmRequest.Name)) {
-			log.Error("%s/%s is forbidden", expName, vmRequest.Name)
+			plog.Error("%s/%s is forbidden", expName, vmRequest.Name)
 			continue
 		}
 
@@ -1150,8 +1163,13 @@ func UpdateVMs(w http.ResponseWriter, r *http.Request) {
 			opts = append(opts, vm.UpdateWithHost(vmRequest.GetHost()))
 		}
 
+		switch vmRequest.SnapshotOption.(type) {
+		case *proto.UpdateVMRequest_Snapshot:
+			opts = append(opts, vm.UpdateWithSnapshot(vmRequest.GetSnapshot()))
+		}
+
 		if err := vm.Update(opts...); err != nil {
-			log.Error("updating VM: %v", err)
+			plog.Error("updating VM", "err", err)
 			http.Error(w, "unable to update VM", http.StatusInternalServerError)
 			return
 		}
@@ -1171,7 +1189,7 @@ func UpdateVMs(w http.ResponseWriter, r *http.Request) {
 		if vm.Running {
 			screenshot, err := util.GetScreenshot(expName, vmRequest.Name, "215")
 			if err != nil {
-				log.Error("getting screenshot: %v", err)
+				plog.Error("getting screenshot", "err", err)
 			} else {
 				vm.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 			}
@@ -1191,7 +1209,7 @@ func UpdateVMs(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /experiments/{exp}/vms/{name}
 func DeleteVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("DeleteVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "DeleteVM")
 
 	var (
 		ctx     = r.Context()
@@ -1223,8 +1241,8 @@ func DeleteVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms", "delete", fmt.Sprintf("%s/%s", expName, name)),
-		broker.NewResource("experiment/vm", fmt.Sprintf("%s/%s", expName, name), "delete"),
+		bt.NewRequestPolicy("vms", "delete", fmt.Sprintf("%s/%s", expName, name)),
+		bt.NewResource("experiment/vm", fmt.Sprintf("%s/%s", expName, name), "delete"),
 		nil,
 	)
 
@@ -1233,7 +1251,7 @@ func DeleteVM(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/vms/{name}/start
 func StartVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("StartVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "StartVM")
 
 	var (
 		ctx      = r.Context()
@@ -1250,7 +1268,7 @@ func StartVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cache.LockVMForStarting(expName, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", expName, "vm", name, "action", "starting", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -1258,15 +1276,15 @@ func StartVM(w http.ResponseWriter, r *http.Request) {
 	defer cache.UnlockVM(expName, name)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/start", "update", fullName),
-		broker.NewResource("experiment/vm", name, "starting"),
+		bt.NewRequestPolicy("vms/start", "update", fullName),
+		bt.NewResource("experiment/vm", name, "starting"),
 		nil,
 	)
 
 	if err := mm.StartVM(mm.NS(expName), mm.VMName(name)); err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/start", "update", fullName),
-			broker.NewResource("experiment/vm", name, "errorStarting"),
+			bt.NewRequestPolicy("vms/start", "update", fullName),
+			bt.NewResource("experiment/vm", name, "errorStarting"),
 			nil,
 		)
 
@@ -1277,8 +1295,8 @@ func StartVM(w http.ResponseWriter, r *http.Request) {
 	exp, err := experiment.Get(expName)
 	if err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/start", "update", fullName),
-			broker.NewResource("experiment/vm", name, "errorStarting"),
+			bt.NewRequestPolicy("vms/start", "update", fullName),
+			bt.NewResource("experiment/vm", name, "errorStarting"),
 			nil,
 		)
 
@@ -1289,8 +1307,8 @@ func StartVM(w http.ResponseWriter, r *http.Request) {
 	v, err := vm.Get(expName, name)
 	if err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/start", "update", fullName),
-			broker.NewResource("experiment/vm", name, "errorStarting"),
+			bt.NewRequestPolicy("vms/start", "update", fullName),
+			bt.NewResource("experiment/vm", name, "errorStarting"),
 			nil,
 		)
 
@@ -1300,7 +1318,7 @@ func StartVM(w http.ResponseWriter, r *http.Request) {
 
 	screenshot, err := util.GetScreenshot(expName, name, "215")
 	if err != nil {
-		log.Error("getting screenshot - %v", err)
+		plog.Error("getting screenshot", "err", err)
 	} else {
 		v.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 	}
@@ -1312,8 +1330,8 @@ func StartVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/start", "update", fullName),
-		broker.NewResource("experiment/vm", expName+"/"+name, "start"),
+		bt.NewRequestPolicy("vms/start", "update", fullName),
+		bt.NewResource("experiment/vm", expName+"/"+name, "start"),
 		body,
 	)
 
@@ -1322,7 +1340,7 @@ func StartVM(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/vms/{name}/stop
 func StopVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("StopVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "StopVM")
 
 	var (
 		ctx      = r.Context()
@@ -1339,7 +1357,7 @@ func StopVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cache.LockVMForStopping(expName, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", expName, "vm", name, "action", "stopping", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -1347,15 +1365,15 @@ func StopVM(w http.ResponseWriter, r *http.Request) {
 	defer cache.UnlockVM(expName, name)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/stop", "update", fullName),
-		broker.NewResource("experiment/vm", name, "stopping"),
+		bt.NewRequestPolicy("vms/stop", "update", fullName),
+		bt.NewResource("experiment/vm", name, "stopping"),
 		nil,
 	)
 
 	if err := mm.StopVM(mm.NS(expName), mm.VMName(name)); err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/stop", "update", fullName),
-			broker.NewResource("experiment/vm", name, "errorStopping"),
+			bt.NewRequestPolicy("vms/stop", "update", fullName),
+			bt.NewResource("experiment/vm", name, "errorStopping"),
 			nil,
 		)
 
@@ -1366,8 +1384,8 @@ func StopVM(w http.ResponseWriter, r *http.Request) {
 	exp, err := experiment.Get(expName)
 	if err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/stop", "update", fullName),
-			broker.NewResource("experiment/vm", name, "errorStopping"),
+			bt.NewRequestPolicy("vms/stop", "update", fullName),
+			bt.NewResource("experiment/vm", name, "errorStopping"),
 			nil,
 		)
 
@@ -1378,8 +1396,8 @@ func StopVM(w http.ResponseWriter, r *http.Request) {
 	v, err := vm.Get(expName, name)
 	if err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/stop", "update", fullName),
-			broker.NewResource("experiment/vm", name, "errorStopping"),
+			bt.NewRequestPolicy("vms/stop", "update", fullName),
+			bt.NewResource("experiment/vm", name, "errorStopping"),
 			nil,
 		)
 
@@ -1394,8 +1412,8 @@ func StopVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/stop", "update", fullName),
-		broker.NewResource("experiment/vm", expName+"/"+name, "stop"),
+		bt.NewRequestPolicy("vms/stop", "update", fullName),
+		bt.NewResource("experiment/vm", expName+"/"+name, "stop"),
 		body,
 	)
 
@@ -1404,7 +1422,7 @@ func StopVM(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{exp}/vms/{name}/restart
 func RestartVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("RestartVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "RestartVM")
 
 	var (
 		ctx      = r.Context()
@@ -1421,7 +1439,7 @@ func RestartVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cache.LockVMForStarting(expName, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", expName, "vm", name, "action", "starting", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -1429,8 +1447,8 @@ func RestartVM(w http.ResponseWriter, r *http.Request) {
 	defer cache.UnlockVM(expName, name)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/restart", "update", fullName),
-		broker.NewResource("experiment/vm", name, "restarting"),
+		bt.NewRequestPolicy("vms/restart", "update", fullName),
+		bt.NewResource("experiment/vm", name, "restarting"),
 		nil,
 	)
 
@@ -1453,7 +1471,7 @@ func RestartVM(w http.ResponseWriter, r *http.Request) {
 
 	screenshot, err := util.GetScreenshot(expName, name, "215")
 	if err != nil {
-		log.Error("getting screenshot - %v", err)
+		plog.Error("getting screenshot", "err", err)
 	} else {
 		v.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 	}
@@ -1465,8 +1483,8 @@ func RestartVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/restart", "update", fullName),
-		broker.NewResource("experiment/vm", expName+"/"+name, "update"),
+		bt.NewRequestPolicy("vms/restart", "update", fullName),
+		bt.NewResource("experiment/vm", expName+"/"+name, "update"),
 		body,
 	)
 
@@ -1475,7 +1493,7 @@ func RestartVM(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{exp}/vms/{name}/shutdown
 func ShutdownVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("ShutdownVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "ShutdownVM")
 
 	var (
 		ctx      = r.Context()
@@ -1492,7 +1510,7 @@ func ShutdownVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cache.LockVMForStopping(expName, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", expName, "vm", name, "action", "stopping", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -1525,8 +1543,8 @@ func ShutdownVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/shutdown", "update", fullName),
-		broker.NewResource("experiment/vm", expName+"/"+name, "shutdown"),
+		bt.NewRequestPolicy("vms/shutdown", "update", fullName),
+		bt.NewResource("experiment/vm", expName+"/"+name, "shutdown"),
 		body,
 	)
 
@@ -1535,7 +1553,7 @@ func ShutdownVM(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{exp}/vms/{name}/reset
 func ResetVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("ResetVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "ResetVM")
 
 	var (
 		ctx      = r.Context()
@@ -1552,7 +1570,7 @@ func ResetVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cache.LockVMForStopping(expName, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", expName, "vm", name, "action", "stopping", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -1583,8 +1601,8 @@ func ResetVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/reset", "update", fullName),
-		broker.NewResource("experiment/vm", expName+"/"+name, "reset"),
+		bt.NewRequestPolicy("vms/reset", "update", fullName),
+		bt.NewResource("experiment/vm", expName+"/"+name, "reset"),
 		body,
 	)
 
@@ -1593,7 +1611,7 @@ func ResetVM(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/vms/{name}/redeploy
 func RedeployVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("RedeployVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "RedeployVM")
 
 	var (
 		ctx      = r.Context()
@@ -1612,7 +1630,7 @@ func RedeployVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cache.LockVMForRedeploying(expName, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", expName, "vm", name, "action", "redeploying", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -1640,8 +1658,8 @@ func RedeployVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/redeploy", "update", fullName),
-		broker.NewResource("experiment/vm", expName+"/"+name, "redeploying"),
+		bt.NewRequestPolicy("vms/redeploy", "update", fullName),
+		bt.NewResource("experiment/vm", expName+"/"+name, "redeploying"),
 		body,
 	)
 
@@ -1650,7 +1668,7 @@ func RedeployVM(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer close(redeployed)
 
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil && err != io.EOF {
 			redeployed <- err
 			return
@@ -1695,11 +1713,11 @@ func RedeployVM(w http.ResponseWriter, r *http.Request) {
 
 	err = <-redeployed
 	if err != nil {
-		log.Error("redeploying VM %s - %v", fullName, err)
+		plog.Error("redeploying VM", "exp", expName, "vm", name, "err", err)
 
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/redeploy", "update", fullName),
-			broker.NewResource("experiment/vm", expName+"/"+name, "errorRedeploying"),
+			bt.NewRequestPolicy("vms/redeploy", "update", fullName),
+			bt.NewResource("experiment/vm", expName+"/"+name, "errorRedeploying"),
 			nil,
 		)
 
@@ -1716,7 +1734,7 @@ func RedeployVM(w http.ResponseWriter, r *http.Request) {
 
 	screenshot, err := util.GetScreenshot(expName, name, "215")
 	if err != nil {
-		log.Error("getting screenshot - %v", err)
+		plog.Error("getting screenshot", "err", err)
 	} else {
 		v.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 	}
@@ -1724,8 +1742,8 @@ func RedeployVM(w http.ResponseWriter, r *http.Request) {
 	body, _ = marshaler.Marshal(util.VMToProtobuf(expName, *v, exp.Spec.Topology()))
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/redeploy", "update", fullName),
-		broker.NewResource("experiment/vm", expName+"/"+name, "redeployed"),
+		bt.NewRequestPolicy("vms/redeploy", "update", fullName),
+		bt.NewResource("experiment/vm", expName+"/"+name, "redeployed"),
 		body,
 	)
 
@@ -1734,7 +1752,7 @@ func RedeployVM(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{exp}/vms/{name}/screenshot.png
 func GetScreenshot(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetScreenshot HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetScreenshot")
 
 	var (
 		ctx    = r.Context()
@@ -1774,7 +1792,7 @@ func GetScreenshot(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{exp}/vms/{name}/captures
 func GetVMCaptures(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetVMCaptures HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetVMCaptures")
 
 	var (
 		ctx  = r.Context()
@@ -1785,7 +1803,7 @@ func GetVMCaptures(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("vms/captures", "list", fmt.Sprintf("%s/%s", exp, name)) {
-		log.Warn("getting captures for VM %s in experiment %s not allowed for %s", name, exp, ctx.Value("user").(string))
+		plog.Warn("getting captures for VM not allowed", "user", ctx.Value("user").(string), "exp", exp, "vm", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -1803,7 +1821,7 @@ func GetVMCaptures(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/vms/{name}/captures
 func StartVMCapture(w http.ResponseWriter, r *http.Request) {
-	log.Debug("StartVMCapture HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "StartVMCapture")
 
 	var (
 		ctx  = r.Context()
@@ -1814,14 +1832,14 @@ func StartVMCapture(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("vms/captures", "create", fmt.Sprintf("%s/%s", exp, name)) {
-		log.Warn("starting capture for VM %s in experiment %s not allowed for %s", name, exp, ctx.Value("user").(string))
+		plog.Warn("starting capture for VM not allowed", "user", ctx.Value("user").(string), "exp", exp, "vm", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Error("reading request body - %v", err)
+		plog.Error("reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1829,20 +1847,20 @@ func StartVMCapture(w http.ResponseWriter, r *http.Request) {
 	var req proto.StartCaptureRequest
 	err = unmarshaler.Unmarshal(body, &req)
 	if err != nil {
-		log.Error("unmarshaling request body - %v", err)
+		plog.Error("unmarshaling request body", "err", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	if err := vm.StartCapture(exp, name, int(req.Interface), req.Filename); err != nil {
-		log.Error("starting VM capture for VM %s in experiment %s - %v", name, exp, err)
+		plog.Error("starting capture for VM", "exp", exp, "vm", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/captures", "create", fmt.Sprintf("%s/%s", exp, name)),
-		broker.NewResource("experiment/vm/capture", fmt.Sprintf("%s/%s", exp, name), "start"),
+		bt.NewRequestPolicy("vms/captures", "create", fmt.Sprintf("%s/%s", exp, name)),
+		bt.NewResource("experiment/vm/capture", fmt.Sprintf("%s/%s", exp, name), "start"),
 		body,
 	)
 
@@ -1851,7 +1869,7 @@ func StartVMCapture(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /experiments/{exp}/vms/{name}/captures
 func StopVMCaptures(w http.ResponseWriter, r *http.Request) {
-	log.Debug("StopVMCaptures HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "StopVMCaptures")
 
 	var (
 		ctx  = r.Context()
@@ -1862,20 +1880,20 @@ func StopVMCaptures(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("vms/captures", "delete", fmt.Sprintf("%s/%s", exp, name)) {
-		log.Warn("stopping capture for VM %s in experiment %s not allowed for %s", name, exp, ctx.Value("user").(string))
+		plog.Warn("stopping captures for VM not allowed", "user", ctx.Value("user").(string), "exp", exp, "vm", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	if err := vm.StopCaptures(exp, name); err != nil {
-		log.Error("stopping VM capture for VM %s in experiment %s - %v", name, exp, err)
+		plog.Error("stopping captures for VM", "exp", exp, "name", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/captures", "delete", fmt.Sprintf("%s/%s", exp, name)),
-		broker.NewResource("experiment/vm/capture", fmt.Sprintf("%s/%s", exp, name), "stop"),
+		bt.NewRequestPolicy("vms/captures", "delete", fmt.Sprintf("%s/%s", exp, name)),
+		bt.NewResource("experiment/vm/capture", fmt.Sprintf("%s/%s", exp, name), "stop"),
 		nil,
 	)
 
@@ -1884,7 +1902,7 @@ func StopVMCaptures(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/captureSubnet
 func StartCaptureSubnet(w http.ResponseWriter, r *http.Request) {
-	log.Debug("StartCaptureSubnet HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "StartCaptureSubnet")
 
 	var (
 		ctx  = r.Context()
@@ -1894,14 +1912,14 @@ func StartCaptureSubnet(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("exp/captureSubnet", "create", exp) {
-		log.Warn("starting subnet capture for experiment %s is not allowed for %s", exp, ctx.Value("user").(string))
+		plog.Warn("starting subnet capture for experiment not allowed", "user", ctx.Value("user").(string), "exp", exp)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Error("reading request body - %v", err)
+		plog.Error("reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1909,23 +1927,22 @@ func StartCaptureSubnet(w http.ResponseWriter, r *http.Request) {
 	var req proto.CaptureSubnetRequest
 	err = unmarshaler.Unmarshal(body, &req)
 	if err != nil {
-		log.Error("unmarshaling request body - %v", err)
+		plog.Error("unmarshaling request body", "err", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	log.Info("Exp:%v Subnet:%v VMS:%v", exp, req.Subnet, req.Vms)
 	vmCaptures, err := vm.CaptureSubnet(exp, req.Subnet, req.Vms)
 
 	if err != nil {
-		log.Error("Unable to start packet subnet capture - %v", err)
+		plog.Error("unable to start subnet capture", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	body, err = marshaler.Marshal(&proto.CaptureList{Captures: util.CapturesToProtobuf(vmCaptures)})
 	if err != nil {
-		log.Error("Unable to marshal vm capture list %v", err)
+		plog.Error("unable to marshal vm capture list", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1935,7 +1952,7 @@ func StartCaptureSubnet(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/stopCaptureSubnet
 func StopCaptureSubnet(w http.ResponseWriter, r *http.Request) {
-	log.Debug("StartCaptureSubnet HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "StopCaptureSubnet")
 
 	var (
 		ctx  = r.Context()
@@ -1945,39 +1962,35 @@ func StopCaptureSubnet(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("exp/captureSubnet", "create", exp) {
-		log.Warn("starting subnet capture for experiment %s is not allowed for %s", exp, ctx.Value("user").(string))
+		plog.Warn("stopping subnet capture for experiment not allowed", "user", ctx.Value("user").(string), "exp", exp)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Error("reading request body - %v", err)
+		plog.Error("reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	var req proto.CaptureSubnetRequest
-	err = unmarshaler.Unmarshal(body, &req)
-	if err != nil {
-		log.Error("unmarshaling request body - %v", err)
+	if err := unmarshaler.Unmarshal(body, &req); err != nil {
+		plog.Error("unmarshaling request body", "err", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	log.Info("Exp:%v Subnet:%v VMS:%v", exp, req.Subnet, req.Vms)
-
+	vms, err := vm.StopCaptureSubnet(exp, req.Subnet, req.Vms)
 	if err != nil {
-		log.Error("Unable to stop packet subnet capture - %v", err)
+		plog.Error("unable to stop subnet capture", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	vms, _ := vm.StopCaptureSubnet(exp, req.Subnet, req.Vms)
-
 	body, err = marshaler.Marshal(&proto.VMNameList{Vms: vms})
 	if err != nil {
-		log.Error("Unable to marshal vm capture list %v", err)
+		plog.Error("unable to marshal vm capture list", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1987,7 +2000,7 @@ func StopCaptureSubnet(w http.ResponseWriter, r *http.Request) {
 
 // GET /experiments/{exp}/vms/{name}/snapshots
 func GetVMSnapshots(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetVMSnapshots HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetVMSnapshots")
 
 	var (
 		ctx  = r.Context()
@@ -1998,14 +2011,14 @@ func GetVMSnapshots(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("vms/snapshots", "list", fmt.Sprintf("%s/%s", exp, name)) {
-		log.Warn("listing snapshots for VM %s in experiment %s not allowed for %s", name, exp, ctx.Value("user").(string))
+		plog.Warn("listing snapshots for VM not allowed", "user", ctx.Value("user").(string), "exp", exp, "vm", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	snapshots, err := vm.Snapshots(exp, name)
 	if err != nil {
-		log.Error("getting list of snapshots for VM %s in experiment %s: %v", name, exp, err)
+		plog.Error("getting list of snapshots for VM", "exp", exp, "vm", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2021,7 +2034,7 @@ func GetVMSnapshots(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/vms/{name}/snapshots
 func SnapshotVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("SnapshotVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "SnapshotVM")
 
 	var (
 		ctx      = r.Context()
@@ -2033,14 +2046,14 @@ func SnapshotVM(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("vms/snapshots", "create", fullName) {
-		log.Warn("snapshotting VM %s in experiment %s not allowed for %s", name, exp, ctx.Value("user").(string))
+		plog.Warn("snapshotting VM not allowed", "user", ctx.Value("user").(string), "exp", exp, "vm", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Error("reading request body - %v", err)
+		plog.Error("reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2048,13 +2061,13 @@ func SnapshotVM(w http.ResponseWriter, r *http.Request) {
 	var req proto.SnapshotRequest
 	err = unmarshaler.Unmarshal(body, &req)
 	if err != nil {
-		log.Error("unmarshaling request body - %v", err)
+		plog.Error("unmarshaling request body", "err", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	if err := cache.LockVMForSnapshotting(exp, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", exp, "vm", name, "action", "snapshotting", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -2062,8 +2075,8 @@ func SnapshotVM(w http.ResponseWriter, r *http.Request) {
 	defer cache.UnlockVM(exp, name)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/snapshots", "create", fullName),
-		broker.NewResource("experiment/vm/snapshot", exp+"/"+name, "creating"),
+		bt.NewRequestPolicy("vms/snapshots", "create", fullName),
+		bt.NewResource("experiment/vm/snapshot", exp+"/"+name, "creating"),
 		nil,
 	)
 
@@ -2079,7 +2092,7 @@ func SnapshotVM(w http.ResponseWriter, r *http.Request) {
 
 			progress, err := strconv.ParseFloat(s, 64)
 			if err == nil {
-				log.Info("snapshot percent complete: %v", progress)
+				plog.Debug("snapshot percent complete", "percent", progress)
 
 				status := map[string]interface{}{
 					"percent": progress / 100,
@@ -2088,8 +2101,8 @@ func SnapshotVM(w http.ResponseWriter, r *http.Request) {
 				marshalled, _ := json.Marshal(status)
 
 				broker.Broadcast(
-					broker.NewRequestPolicy("vms/snapshots", "create", fullName),
-					broker.NewResource("experiment/vm/snapshot", exp+"/"+name, "progress"),
+					bt.NewRequestPolicy("vms/snapshots", "create", fullName),
+					bt.NewResource("experiment/vm/snapshot", exp+"/"+name, "progress"),
 					marshalled,
 				)
 			}
@@ -2100,19 +2113,19 @@ func SnapshotVM(w http.ResponseWriter, r *http.Request) {
 
 	if err := vm.Snapshot(exp, name, req.Filename, cb); err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/snapshots", "create", fullName),
-			broker.NewResource("experiment/vm/snapshot", exp+"/"+name, "errorCreating"),
+			bt.NewRequestPolicy("vms/snapshots", "create", fullName),
+			bt.NewResource("experiment/vm/snapshot", exp+"/"+name, "errorCreating"),
 			nil,
 		)
 
-		log.Error("snapshotting VM %s in experiment %s - %v", name, exp, err)
+		plog.Error("snapshotting VM", "exp", exp, "vm", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/snapshots", "create", fullName),
-		broker.NewResource("experiment/vm/snapshot", exp+"/"+name, "create"),
+		bt.NewRequestPolicy("vms/snapshots", "create", fullName),
+		bt.NewResource("experiment/vm/snapshot", exp+"/"+name, "create"),
 		nil,
 	)
 
@@ -2121,7 +2134,7 @@ func SnapshotVM(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/vms/{name}/snapshots/{snapshot}
 func RestoreVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("RestoreVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "RestoreVM")
 
 	var (
 		ctx      = r.Context()
@@ -2134,13 +2147,13 @@ func RestoreVM(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("vms/snapshots", "update", fullName) {
-		log.Warn("restoring VM %s in experiment %s not allowed for %s", name, exp, ctx.Value("user").(string))
+		plog.Warn("restoring VM not allowed", "user", ctx.Value("user").(string), "exp", exp, "vm", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	if err := cache.LockVMForRestoring(exp, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", exp, "vm", name, "action", "restoring", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -2148,26 +2161,26 @@ func RestoreVM(w http.ResponseWriter, r *http.Request) {
 	defer cache.UnlockVM(exp, name)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/snapshots", "create", fullName),
-		broker.NewResource("experiment/vm/snapshot", fmt.Sprintf("%s/%s", exp, name), "restoring"),
+		bt.NewRequestPolicy("vms/snapshots", "create", fullName),
+		bt.NewResource("experiment/vm/snapshot", fmt.Sprintf("%s/%s", exp, name), "restoring"),
 		nil,
 	)
 
 	if err := vm.Restore(exp, name, snap); err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/snapshots", "create", fullName),
-			broker.NewResource("experiment/vm/snapshot", fmt.Sprintf("%s/%s", exp, name), "errorRestoring"),
+			bt.NewRequestPolicy("vms/snapshots", "create", fullName),
+			bt.NewResource("experiment/vm/snapshot", fmt.Sprintf("%s/%s", exp, name), "errorRestoring"),
 			nil,
 		)
 
-		log.Error("restoring VM %s in experiment %s - %v", name, exp, err)
+		plog.Error("restoring VM", "exp", exp, "vm", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/snapshots", "create", fullName),
-		broker.NewResource("experiment/vm/snapshot", exp+"/"+name, "restore"),
+		bt.NewRequestPolicy("vms/snapshots", "create", fullName),
+		bt.NewResource("experiment/vm/snapshot", exp+"/"+name, "restore"),
 		nil,
 	)
 
@@ -2176,7 +2189,7 @@ func RestoreVM(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/vms/{name}/commit
 func CommitVM(w http.ResponseWriter, r *http.Request) {
-	log.Debug("CommitVM HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "CommitVM")
 
 	var (
 		ctx      = r.Context()
@@ -2188,14 +2201,14 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("vms/commit", "create", fullName) {
-		log.Warn("committing VM %s in experiment %s not allowed for %s", name, expName, ctx.Value("user").(string))
+		plog.Warn("committing VM not allowed", "user", ctx.Value("user").(string), "exp", expName, "vm", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Error("reading request body - %v", err)
+		plog.Error("reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2210,13 +2223,13 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 		var req proto.BackingImageRequest
 		err = unmarshaler.Unmarshal(body, &req)
 		if err != nil {
-			log.Error("unmarshaling request body - %v", err)
+			plog.Error("unmarshaling request body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		if req.Filename == "" {
-			log.Error("missing filename for commit")
+			plog.Error("missing filename for commit")
 			http.Error(w, "missing 'filename' key", http.StatusBadRequest)
 			return
 		}
@@ -2225,7 +2238,7 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cache.LockVMForCommitting(expName, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", expName, "vm", name, "action", "committing", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -2251,8 +2264,8 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 	body, _ = marshaler.Marshal(payload)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/commit", "create", fullName),
-		broker.NewResource("experiment/vm/commit", expName+"/"+name, "committing"),
+		bt.NewRequestPolicy("vms/commit", "create", fullName),
+		bt.NewResource("experiment/vm/commit", expName+"/"+name, "committing"),
 		body,
 	)
 
@@ -2260,7 +2273,7 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		for s := range status {
-			log.Info("VM commit percent complete: %v", s)
+			plog.Info("VM commit percent complete", "percent", s)
 
 			status := map[string]interface{}{
 				"percent": s,
@@ -2269,8 +2282,8 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 			marshalled, _ := json.Marshal(status)
 
 			broker.Broadcast(
-				broker.NewRequestPolicy("vms/commit", "create", fullName),
-				broker.NewResource("experiment/vm/commit", expName+"/"+name, "progress"),
+				bt.NewRequestPolicy("vms/commit", "create", fullName),
+				bt.NewResource("experiment/vm/commit", expName+"/"+name, "progress"),
 				marshalled,
 			)
 		}
@@ -2280,12 +2293,12 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 
 	if _, err = vm.CommitToDisk(expName, name, filename, cb); err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/commit", "create", fullName),
-			broker.NewResource("experiment/vm/commit", expName+"/"+name, "errorCommitting"),
+			bt.NewRequestPolicy("vms/commit", "create", fullName),
+			bt.NewResource("experiment/vm/commit", expName+"/"+name, "errorCommitting"),
 			nil,
 		)
 
-		log.Error("committing VM %s in experiment %s - %v", name, expName, err)
+		plog.Error("committing VM", "exp", expName, "vm", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2293,8 +2306,8 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 	exp, err := experiment.Get(expName)
 	if err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/commit", "create", fullName),
-			broker.NewResource("experiment/vm/commit", expName+"/"+name, "errorCommitting"),
+			bt.NewRequestPolicy("vms/commit", "create", fullName),
+			bt.NewResource("experiment/vm/commit", expName+"/"+name, "errorCommitting"),
 			nil,
 		)
 
@@ -2305,8 +2318,8 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 	v, err := vm.Get(expName, name)
 	if err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/commit", "create", fullName),
-			broker.NewResource("experiment/vm/commit", expName+"/"+name, "errorCommitting"),
+			bt.NewRequestPolicy("vms/commit", "create", fullName),
+			bt.NewResource("experiment/vm/commit", expName+"/"+name, "errorCommitting"),
 			nil,
 		)
 
@@ -2318,8 +2331,8 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 	body, _ = marshaler.Marshal(payload)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/commit", "create", fmt.Sprintf("%s/%s", expName, name)),
-		broker.NewResource("experiment/vm/commit", expName+"/"+name, "commit"),
+		bt.NewRequestPolicy("vms/commit", "create", fmt.Sprintf("%s/%s", expName, name)),
+		bt.NewResource("experiment/vm/commit", expName+"/"+name, "commit"),
 		body,
 	)
 
@@ -2328,7 +2341,7 @@ func CommitVM(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/{exp}/vms/{name}/memorySnapshot
 func CreateVMMemorySnapshot(w http.ResponseWriter, r *http.Request) {
-	log.Debug("CreateVMMemorySnapshot HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "CreateVMMemorySnapshot")
 
 	var (
 		ctx      = r.Context()
@@ -2340,14 +2353,14 @@ func CreateVMMemorySnapshot(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if !role.Allowed("vms/memorySnapshot", "create", fullName) {
-		log.Warn("Capturing memory snapshot of VM %s in experiment %s not allowed for %s", name, exp, ctx.Value("user").(string))
+		plog.Warn("capturing memory snapshot of VM not allowed", "user", ctx.Value("user").(string), "exp", exp, "vm", name)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Error("reading request body - %v", err)
+		plog.Error("reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2360,13 +2373,13 @@ func CreateVMMemorySnapshot(w http.ResponseWriter, r *http.Request) {
 		var req proto.MemorySnapshotRequest
 		err = unmarshaler.Unmarshal(body, &req)
 		if err != nil {
-			log.Error("unmarshaling request body - %v", err)
+			plog.Error("unmarshaling request body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		if req.Filename == "" {
-			log.Error("missing filename for memory snapshot")
+			plog.Error("missing filename for memory snapshot")
 			http.Error(w, "missing 'filename' key", http.StatusBadRequest)
 			return
 		}
@@ -2375,7 +2388,7 @@ func CreateVMMemorySnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cache.LockVMForMemorySnapshotting(exp, name); err != nil {
-		log.Warn(err.Error())
+		plog.Error("locking VM", "exp", exp, "vm", name, "action", "memory snapshotting", "err", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -2392,8 +2405,8 @@ func CreateVMMemorySnapshot(w http.ResponseWriter, r *http.Request) {
 	body, _ = marshaler.Marshal(payload)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/memorySnapshot", "create", fullName),
-		broker.NewResource("experiment/vm/memorySnapshot", exp+"/"+name, "committing"),
+		bt.NewRequestPolicy("vms/memorySnapshot", "create", fullName),
+		bt.NewResource("experiment/vm/memorySnapshot", exp+"/"+name, "committing"),
 		body,
 	)
 
@@ -2415,13 +2428,13 @@ func CreateVMMemorySnapshot(w http.ResponseWriter, r *http.Request) {
 					"percent": progress,
 				}
 
-				log.Info("%s/%s memory snapshot percent complete: %v", exp, name, progress)
+				plog.Info("memory snapshot percent complete", "percent", progress)
 
 				marshalled, _ := json.Marshal(status)
 
 				broker.Broadcast(
-					broker.NewRequestPolicy("vms/memorySnapshot", "create", fullName),
-					broker.NewResource("experiment/vm/memorySnapshot", exp+"/"+name, "progress"),
+					bt.NewRequestPolicy("vms/memorySnapshot", "create", fullName),
+					bt.NewResource("experiment/vm/memorySnapshot", exp+"/"+name, "progress"),
 					marshalled,
 				)
 			}
@@ -2432,20 +2445,22 @@ func CreateVMMemorySnapshot(w http.ResponseWriter, r *http.Request) {
 
 	if _, err = vm.MemorySnapshot(exp, name, filename, cb); err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("vms/memorySnapshot", "create", fullName),
-			broker.NewResource("experiment/vm/memorySnapshot", exp+"/"+name, "errorCommitting"),
+			bt.NewRequestPolicy("vms/memorySnapshot", "create", fullName),
+			bt.NewResource("experiment/vm/memorySnapshot", exp+"/"+name, "errorCommitting"),
 			nil,
 		)
 
-		log.Error("memory snapshot for VM %s in experiment %s - %v", name, exp, err)
+		plog.Error("memory snapshot for VM", "exp", exp, "vm", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	marshalled, _ := json.Marshal(util.WithRoot("disk", filename))
+
 	broker.Broadcast(
-		broker.NewRequestPolicy("vms/memorySnapshot", "create", fmt.Sprintf("%s/%s", exp, name)),
-		broker.NewResource("experiment/vm/memorySnapshot", exp+"/"+name, "commit"),
-		nil,
+		bt.NewRequestPolicy("vms/memorySnapshot", "create", fmt.Sprintf("%s/%s", exp, name)),
+		bt.NewResource("experiment/vm/memorySnapshot", exp+"/"+name, "commit"),
+		marshalled,
 	)
 
 	w.WriteHeader(http.StatusNoContent)
@@ -2453,7 +2468,7 @@ func CreateVMMemorySnapshot(w http.ResponseWriter, r *http.Request) {
 
 // GET /vms
 func GetAllVMs(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetAllVMs HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetAllVMs")
 
 	var (
 		ctx   = r.Context()
@@ -2469,7 +2484,7 @@ func GetAllVMs(w http.ResponseWriter, r *http.Request) {
 
 	exps, err := experiment.List()
 	if err != nil {
-		log.Error("getting experiments: %v", err)
+		plog.Error("getting experiments", "err", err)
 	}
 
 	allowed := []*proto.VM{}
@@ -2499,7 +2514,7 @@ func GetAllVMs(w http.ResponseWriter, r *http.Request) {
 			if size != "" {
 				screenshot, err := util.GetScreenshot(exp.Metadata.Name, vm.Name, size)
 				if err != nil {
-					log.Error("getting screenshot: %v", err)
+					plog.Error("getting screenshot", "err", err)
 				} else {
 					vm.Screenshot = "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot)
 				}
@@ -2522,7 +2537,7 @@ func GetAllVMs(w http.ResponseWriter, r *http.Request) {
 
 // GET /applications
 func GetApplications(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetApplications HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetApplications")
 
 	var (
 		ctx  = r.Context()
@@ -2552,7 +2567,7 @@ func GetApplications(w http.ResponseWriter, r *http.Request) {
 
 // GET /topologies
 func GetTopologies(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetTopologies HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetTopologies")
 
 	var (
 		ctx  = r.Context()
@@ -2588,7 +2603,7 @@ func GetTopologies(w http.ResponseWriter, r *http.Request) {
 
 // GET /topologies/{topo}/scenarios
 func GetScenarios(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetScenarios HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetScenarios")
 
 	var (
 		ctx  = r.Context()
@@ -2632,7 +2647,7 @@ func GetScenarios(w http.ResponseWriter, r *http.Request) {
 		if role.Allowed("scenarios", "list", s.Metadata.Name) {
 			apps, err := scenario.AppList(s.Metadata.Name)
 			if err != nil {
-				log.Error("getting apps for scenario %s: %v", s.Metadata.Name, err)
+				plog.Error("getting apps for scenario", "scenario", s.Metadata.Name, "err", err)
 				continue
 			}
 
@@ -2657,13 +2672,15 @@ func GetScenarios(w http.ResponseWriter, r *http.Request) {
 
 // GET /disks
 func GetDisks(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetDisks HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetDisks")
 
 	var (
-		ctx     = r.Context()
-		role    = ctx.Value("role").(rbac.Role)
-		query   = r.URL.Query()
-		expName = query.Get("expName")
+		ctx             = r.Context()
+		role            = ctx.Value("role").(rbac.Role)
+		query           = r.URL.Query()
+		expName         = query.Get("expName")
+		diskType        = query.Get("diskType")
+		defaultDiskType = cluster.VM_IMAGE | cluster.CONTAINER_IMAGE
 	)
 
 	if !role.Allowed("disks", "list") {
@@ -2671,7 +2688,13 @@ func GetDisks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	disks, err := cluster.GetImages(expName, cluster.VM_IMAGE)
+	if len(diskType) > 0 {
+		if strings.Contains(diskType, "ISO") {
+			defaultDiskType = cluster.ISO_IMAGE
+		}
+	}
+
+	disks, err := cluster.GetImages(expName, defaultDiskType)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2697,7 +2720,7 @@ func GetDisks(w http.ResponseWriter, r *http.Request) {
 
 // GET /hosts
 func GetClusterHosts(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetClusterHosts HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetClusterHosts")
 
 	var (
 		ctx  = r.Context()
@@ -2731,762 +2754,9 @@ func GetClusterHosts(w http.ResponseWriter, r *http.Request) {
 	w.Write(marshalled)
 }
 
-// GET /logs
-func GetLogs(w http.ResponseWriter, r *http.Request) {
-	if !o.publishLogs {
-		w.WriteHeader(http.StatusNotImplemented)
-	}
-
-	type LogLine struct {
-		Source    string `json:"source"`
-		Timestamp string `json:"timestamp"`
-		Epoch     int64  `json:"epoch"`
-		Level     string `json:"level"`
-		Log       string `json:"log"`
-
-		// Not exported so it doesn't get included in serialized JSON.
-		ts time.Time
-	}
-
-	var (
-		since time.Duration
-		limit int
-
-		logs    = make(map[int][]LogLine)
-		logChan = make(chan LogLine)
-		done    = make(chan struct{})
-		wait    errgroup.Group
-
-		logFiles = map[string]string{
-			"minimega": o.minimegaLogs,
-			"phenix":   o.phenixLogs,
-		}
-	)
-
-	// If no since duration is provided, or the value provided is not a
-	// valid duration string, since will default to 1h.
-	if err := parseDuration(r.URL.Query().Get("since"), &since); err != nil {
-		since = 1 * time.Hour
-	}
-
-	// If no limit is provided, or the value provided is not an int, limit
-	// will default to 0.
-	parseInt(r.URL.Query().Get("limit"), &limit)
-
-	go func() {
-		for l := range logChan {
-			ts := int(l.ts.Unix())
-
-			tl := logs[ts]
-			tl = append(tl, l)
-
-			logs[ts] = tl
-		}
-
-		close(done)
-	}()
-
-	for k := range logFiles {
-		name := k
-		path := logFiles[k]
-
-		wait.Go(func() error {
-			f, err := os.Open(path)
-			if err != nil {
-				// This *most likely* means the log file doesn't exist yet, so just exit
-				// out of the Goroutine cleanly.
-				return nil
-			}
-
-			defer f.Close()
-
-			var (
-				scanner = bufio.NewScanner(f)
-				// Used to detect multi-line logs in tailed log files.
-				body *LogLine
-			)
-
-			for scanner.Scan() {
-				parts := logLineRegex.FindStringSubmatch(scanner.Text())
-
-				if len(parts) == 4 {
-					ts, err := time.ParseInLocation("2006/01/02 15:04:05", parts[1], time.Local)
-					if err != nil {
-						continue
-					}
-
-					if time.Since(ts) > since {
-						continue
-					}
-
-					if parts[2] == "WARNING" {
-						parts[2] = "WARN"
-					}
-
-					body = &LogLine{
-						Source:    name,
-						Timestamp: parts[1],
-						Epoch:     ts.Unix(),
-						Level:     parts[2],
-						Log:       parts[3],
-
-						ts: ts,
-					}
-				} else if body != nil {
-					body.Log = scanner.Text()
-				} else {
-					continue
-				}
-
-				logChan <- *body
-			}
-
-			if err := scanner.Err(); err != nil {
-				return fmt.Errorf("scanning %s log file at %s: %w", name, path, err)
-			}
-
-			return nil
-		})
-	}
-
-	if err := wait.Wait(); err != nil {
-		http.Error(w, "error reading logs", http.StatusInternalServerError)
-		return
-	}
-
-	// Close log channel, marking it as done.
-	close(logChan)
-	// Wait for Goroutine processing logs from log channel to be done.
-	<-done
-
-	var (
-		idx, offset int
-		ts          = make([]int, len(logs))
-		limited     []LogLine
-	)
-
-	// Put log timestamps into slice so they can be sorted.
-	for k := range logs {
-		ts[idx] = k
-		idx++
-	}
-
-	// Sort log timestamps.
-	sort.Ints(ts)
-
-	// Determine if final log slice should be limited.
-	if limit != 0 && limit < len(ts) {
-		offset = len(ts) - limit
-	}
-
-	// Loop through sorted, limited log timestamps and grab actual logs
-	// for given timestamp.
-	for _, k := range ts[offset:] {
-		limited = append(limited, logs[k]...)
-	}
-
-	marshalled, _ := json.Marshal(util.WithRoot("logs", limited))
-	w.Write(marshalled)
-}
-
-// GET /users
-func GetUsers(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetUsers HTTP handler called")
-
-	var (
-		ctx   = r.Context()
-		uname = ctx.Value("user").(string)
-		role  = ctx.Value("role").(rbac.Role)
-	)
-
-	var resp []*proto.User
-
-	if role.Allowed("users", "list") {
-		users, err := rbac.GetUsers()
-		if err != nil {
-			http.Error(w, "", http.StatusInternalServerError)
-			return
-		}
-
-		for _, u := range users {
-			if role.Allowed("users", "list", u.Username()) {
-				resp = append(resp, util.UserToProtobuf(*u))
-			}
-		}
-	} else if role.Allowed("users", "get", uname) {
-		user, err := rbac.GetUser(uname)
-		if err != nil {
-			http.Error(w, "", http.StatusInternalServerError)
-			return
-		}
-
-		resp = append(resp, util.UserToProtobuf(*user))
-	} else {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	body, err := marshaler.Marshal(&proto.UserList{Users: resp})
-	if err != nil {
-		log.Error("marshaling users: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Write(body)
-}
-
-// POST /users
-func CreateUser(w http.ResponseWriter, r *http.Request) {
-	log.Debug("CreateUser HTTP handler called")
-
-	var (
-		ctx  = r.Context()
-		role = ctx.Value("role").(rbac.Role)
-	)
-
-	if !role.Allowed("users", "create") {
-		log.Warn("creating users not allowed for %s", ctx.Value("user").(string))
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Error("reading request body - %v", err)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	var req proto.CreateUserRequest
-	if err := unmarshaler.Unmarshal(body, &req); err != nil {
-		log.Error("unmashaling request body - %v", err)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	user := rbac.NewUser(req.GetUsername(), req.GetPassword())
-
-	user.Spec.FirstName = req.GetFirstName()
-	user.Spec.LastName = req.GetLastName()
-
-	uRole, err := rbac.RoleFromConfig(req.GetRoleName())
-	if err != nil {
-		log.Error("role name not found - %s", req.GetRoleName())
-		http.Error(w, "role not found", http.StatusBadRequest)
-		return
-	}
-
-	uRole.SetResourceNames(req.GetResourceNames()...)
-
-	// allow user to get and update their own user details
-	uRole.AddPolicy(
-		[]string{"users"},
-		[]string{req.GetUsername()},
-		[]string{"get", "patch"},
-	)
-
-	user.SetRole(uRole)
-
-	resp := util.UserToProtobuf(*user)
-
-	body, err = marshaler.Marshal(resp)
-	if err != nil {
-		log.Error("marshaling user %s: %v", user.Username(), err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	broker.Broadcast(
-		broker.NewRequestPolicy("users", "create", ""),
-		broker.NewResource("user", req.GetUsername(), "create"),
-		body,
-	)
-
-	w.Write(body)
-}
-
-// GET /users/{username}
-func GetUser(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetUser HTTP handler called")
-
-	var (
-		ctx   = r.Context()
-		role  = ctx.Value("role").(rbac.Role)
-		vars  = mux.Vars(r)
-		uname = vars["username"]
-	)
-
-	if !role.Allowed("users", "get", uname) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	user, err := rbac.GetUser(uname)
-	if err != nil {
-		http.Error(w, "unable to get user", http.StatusInternalServerError)
-		return
-	}
-
-	resp := util.UserToProtobuf(*user)
-
-	body, err := marshaler.Marshal(resp)
-	if err != nil {
-		log.Error("marshaling user %s: %v", user.Username(), err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Write(body)
-}
-
-// PATCH /users/{username}
-func UpdateUser(w http.ResponseWriter, r *http.Request) {
-	log.Debug("UpdateUser HTTP handler called")
-
-	var (
-		ctx   = r.Context()
-		role  = ctx.Value("role").(rbac.Role)
-		vars  = mux.Vars(r)
-		uname = vars["username"]
-	)
-
-	if !role.Allowed("users", "patch", uname) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	var req proto.UpdateUserRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	u, err := rbac.GetUser(uname)
-	if err != nil {
-		http.Error(w, "unable to get user", http.StatusInternalServerError)
-		return
-	}
-
-	if req.FirstName != "" {
-		if err := u.UpdateFirstName(req.FirstName); err != nil {
-			log.Error("updating first name for user %s: %v", uname, err)
-			http.Error(w, "unable to update user", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if req.LastName != "" {
-		if err := u.UpdateLastName(req.LastName); err != nil {
-			log.Error("updating last name for user %s: %v", uname, err)
-			http.Error(w, "unable to update user", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if req.RoleName != "" && role.Allowed("users/roles", "patch", uname) {
-		uRole, err := rbac.RoleFromConfig(req.GetRoleName())
-		if err != nil {
-			log.Error("role name not found - %s", req.GetRoleName())
-			http.Error(w, "role not found", http.StatusBadRequest)
-			return
-		}
-
-		uRole.SetResourceNames(req.GetResourceNames()...)
-
-		// allow user to get their own user details
-		uRole.AddPolicy(
-			[]string{"users"},
-			[]string{uname},
-			[]string{"get", "patch"},
-		)
-
-		u.SetRole(uRole)
-	}
-
-	if req.NewPassword != "" {
-		if req.Password == "" {
-			log.Error("new password provided without old password for user %s", uname)
-			http.Error(w, "cannot change password without password", http.StatusBadRequest)
-			return
-		}
-
-		if err := u.UpdatePassword(req.Password, req.NewPassword); err != nil {
-			log.Error("updating password for user %s: %v", uname, err)
-			http.Error(w, "unable to update password", http.StatusBadRequest)
-			return
-		}
-	}
-
-	resp := util.UserToProtobuf(*u)
-
-	body, err = marshaler.Marshal(resp)
-	if err != nil {
-		log.Error("marshaling user %s: %v", uname, err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	broker.Broadcast(
-		broker.NewRequestPolicy("users", "patch", uname),
-		broker.NewResource("user", uname, "update"),
-		body,
-	)
-
-	w.Write(body)
-}
-
-// DELETE /users/{username}
-func DeleteUser(w http.ResponseWriter, r *http.Request) {
-	log.Debug("DeleteUser HTTP handler called")
-
-	var (
-		ctx   = r.Context()
-		user  = ctx.Value("user").(string)
-		role  = ctx.Value("role").(rbac.Role)
-		vars  = mux.Vars(r)
-		uname = vars["username"]
-	)
-
-	if user == uname {
-		http.Error(w, "you cannot delete your own user", http.StatusForbidden)
-		return
-	}
-
-	if !role.Allowed("users", "delete", uname) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	if err := config.Delete("user/" + uname); err != nil {
-		log.Error("deleting user %s: %v", uname, err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	broker.Broadcast(
-		broker.NewRequestPolicy("users", "delete", uname),
-		broker.NewResource("user", uname, "delete"),
-		nil,
-	)
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// POST /users/{username}/tokens
-func CreateUserToken(w http.ResponseWriter, r *http.Request) {
-	log.Debug("CreateUserToken HTTP handler called")
-
-	var (
-		ctx   = r.Context()
-		role  = ctx.Value("role").(rbac.Role)
-		vars  = mux.Vars(r)
-		uname = vars["username"]
-	)
-
-	if !role.Allowed("users", "patch", uname) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	u, err := rbac.GetUser(uname)
-	if err != nil {
-		http.Error(w, "unable to get user", http.StatusInternalServerError)
-		return
-	}
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	var data map[string]string
-
-	if err := json.Unmarshal(body, &data); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	dur, err := time.ParseDuration(data["lifetime"])
-	if err != nil {
-		http.Error(w, "invalid token lifetime provided", http.StatusBadRequest)
-		return
-	}
-
-	exp := time.Now().Add(dur)
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": u.Username(),
-		"exp": exp.Unix(),
-	})
-
-	// Sign and get the complete encoded token as a string using the secret
-	signed, err := token.SignedString([]byte(o.jwtKey))
-	if err != nil {
-		http.Error(w, "failed to sign JWT", http.StatusInternalServerError)
-		return
-	}
-
-	note := fmt.Sprintf("manually generated - %s", time.Now().Format(time.RFC3339))
-	if desc := data["desc"]; desc != "" {
-		note = data["desc"]
-	}
-
-	if err := u.AddToken(signed, note); err != nil {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
-	}
-
-	resp := map[string]string{
-		"token": signed,
-		"desc":  note,
-		"exp":   exp.Format(time.RFC3339),
-	}
-
-	body, _ = json.Marshal(resp)
-	w.Write(body)
-}
-
-// GET /roles
-func GetRoles(w http.ResponseWriter, r *http.Request) {
-	log.Debug("ListRoles HTTP handler called")
-
-	var (
-		ctx   = r.Context()
-		role  = ctx.Value("role").(rbac.Role)
-	)
-
-	if !role.Allowed("roles", "list") {
-		http.Error(w, "forbidden to list roles", http.StatusForbidden)
-		return
-	}
-
-	var resp []*proto.Role
-
-	roles, err := rbac.GetRoles()
-	for _, r := range roles {
-		resp = append(resp, util.RoleToProtobuf(*r))
-	}
-	if err != nil {
-		log.Error("error retrieving roles - %v", err)
-		http.Error(w, "Error retrieving roles", http.StatusInternalServerError)
-		return
-	}
-
-
-	body, err := marshaler.Marshal(&proto.RoleList{Roles: resp})
-	if err != nil {
-		log.Error("marshaling roles: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Write(body)
-}
-
-func Signup(w http.ResponseWriter, r *http.Request) {
-	log.Debug("Signup HTTP handler called")
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Error("reading request body - %v", err)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	var req proto.SignupUserRequest
-	if err := unmarshaler.Unmarshal(body, &req); err != nil {
-		log.Error("unmashaling request body - %v", err)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	if o.proxyAuthHeader != "" {
-		if user := r.Header.Get(o.proxyAuthHeader); user != req.GetUsername() {
-			http.Error(w, "proxy user mismatch", http.StatusUnauthorized)
-			return
-		}
-	}
-
-	u := rbac.NewUser(req.GetUsername(), req.GetPassword())
-
-	u.Spec.FirstName = req.GetFirstName()
-	u.Spec.LastName = req.GetLastName()
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": u.Username(),
-		"exp": time.Now().Add(o.jwtLifetime).Unix(),
-	})
-
-	// Sign and get the complete encoded token as a string using the secret
-	signed, err := token.SignedString([]byte(o.jwtKey))
-	if err != nil {
-		http.Error(w, "failed to sign JWT", http.StatusInternalServerError)
-		return
-	}
-
-	if err := u.AddToken(signed, time.Now().Format(time.RFC3339)); err != nil {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
-	}
-
-	resp := &proto.LoginResponse{
-		User:  util.UserToProtobuf(*u),
-		Token: signed,
-	}
-
-	body, err = marshaler.Marshal(resp)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Write(body)
-}
-
-func Login(w http.ResponseWriter, r *http.Request) {
-	log.Debug("Login HTTP handler called")
-
-	var (
-		user, pass string
-		proxied    bool
-	)
-
-	switch r.Method {
-	case "GET":
-		if o.proxyAuthHeader == "" {
-			query := r.URL.Query()
-
-			user = query.Get("user")
-			if user == "" {
-				http.Error(w, "no username provided", http.StatusBadRequest)
-				return
-			}
-
-			pass = query.Get("pass")
-			if pass == "" {
-				http.Error(w, "no password provided", http.StatusBadRequest)
-				return
-			}
-		} else {
-			user = r.Header.Get(o.proxyAuthHeader)
-
-			if user == "" {
-				http.Error(w, "proxy authentication failed", http.StatusUnauthorized)
-				return
-			}
-
-			proxied = true
-		}
-	case "POST":
-		if o.proxyAuthHeader != "" {
-			http.Error(w, "proxy auth enabled -- must login via GET request", http.StatusBadRequest)
-			return
-		}
-
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "no data provided in POST", http.StatusBadRequest)
-			return
-		}
-
-		var req proto.LoginRequest
-		if err := unmarshaler.Unmarshal(body, &req); err != nil {
-			http.Error(w, "invalid data provided in POST", http.StatusBadRequest)
-			return
-		}
-
-		if user = req.User; user == "" {
-			http.Error(w, "invalid username provided in POST", http.StatusBadRequest)
-			return
-		}
-
-		if pass = req.Pass; pass == "" {
-			http.Error(w, "invalid password provided in POST", http.StatusBadRequest)
-			return
-		}
-	default:
-		http.Error(w, "invalid method", http.StatusBadRequest)
-		return
-	}
-
-	u, err := rbac.GetUser(user)
-	if err != nil {
-		http.Error(w, user, http.StatusNotFound)
-		return
-	}
-
-	if !proxied {
-		if err := u.ValidatePassword(pass); err != nil {
-			http.Error(w, "invalid creds", http.StatusUnauthorized)
-			return
-		}
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": u.Username(),
-		"exp": time.Now().Add(o.jwtLifetime).Unix(),
-	})
-
-	// Sign and get the complete encoded token as a string using the secret
-	signed, err := token.SignedString([]byte(o.jwtKey))
-	if err != nil {
-		http.Error(w, "failed to sign JWT", http.StatusInternalServerError)
-		return
-	}
-
-	if err := u.AddToken(signed, time.Now().Format(time.RFC3339)); err != nil {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
-	}
-
-	resp := &proto.LoginResponse{
-		User:  util.UserToProtobuf(*u),
-		Token: signed,
-	}
-
-	body, err := marshaler.Marshal(resp)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Write(body)
-}
-
-func Logout(w http.ResponseWriter, r *http.Request) {
-	log.Debug("Logout HTTP handler called")
-
-	var (
-		ctx   = r.Context()
-		user  = ctx.Value("user").(string)
-		token = ctx.Value("jwt").(string)
-	)
-
-	u, err := rbac.GetUser(user)
-	if err != nil {
-		http.Error(w, "cannot find user", http.StatusBadRequest)
-		return
-	}
-
-	if err := u.DeleteToken(token); err != nil {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
 // GET /errors/{uuid}
 func GetError(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("GetError HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetError")
 
 	var (
 		uuid  = mux.Vars(r)["uuid"]
@@ -3507,8 +2777,10 @@ func GetError(w http.ResponseWriter, r *http.Request) error {
 
 // POST /console
 func CreateConsole(w http.ResponseWriter, r *http.Request) {
+	plog.Debug("HTTP handler called", "handler", "CreateConsole")
+
 	if !o.minimegaConsole {
-		log.Error("request made for minimega console, but console not enabled")
+		plog.Error("request made for minimega console, but console not enabled")
 		http.Error(w, "'minimega-console' CLI arg not enabled", http.StatusMethodNotAllowed)
 		return
 	}
@@ -3522,7 +2794,7 @@ func CreateConsole(w http.ResponseWriter, r *http.Request) {
 	// create a new console
 	phenix, err := os.Executable()
 	if err != nil {
-		log.Error("unable to get full path to phenix")
+		plog.Error("unable to get full path to phenix")
 		http.Error(w, "", http.StatusInternalServerError)
 		return
 	}
@@ -3536,7 +2808,7 @@ func CreateConsole(w http.ResponseWriter, r *http.Request) {
 
 	pid := cmd.Process.Pid
 
-	log.Info("spawned new minimega console, pid = %v", pid)
+	plog.Info("spawned new minimega console", "pid", pid)
 
 	ptyMu.Lock()
 	ptys[pid] = tty
@@ -3590,7 +2862,7 @@ func ResizeConsole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Debug("resize console %v to %d x %d", pid, cols, rows)
+	plog.Debug("resize console", "pid", pid, "cols", cols, "rows", rows)
 
 	ws := struct {
 		R, C, X, Y uint16
@@ -3606,7 +2878,7 @@ func ResizeConsole(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if errno != 0 {
-		log.Error("unable to set winsize: %v", syscall.Errno(errno))
+		plog.Error("unable to set winsize", "err", syscall.Errno(errno))
 		http.Error(w, "set winsize failed", http.StatusInternalServerError)
 	}
 
@@ -3652,14 +2924,14 @@ func WsConsole(w http.ResponseWriter, r *http.Request) {
 
 		proc, err := os.FindProcess(pid)
 		if err != nil {
-			log.Error("unable to find process: %v", pid)
+			plog.Warn("unable to find process", "pid", pid)
 			return
 		}
 
 		go io.Copy(ws, tty)
 		io.Copy(tty, ws)
 
-		log.Debug("Killing minimega console: %v", pid)
+		plog.Debug("killing minimega console", "pid", pid)
 
 		proc.Kill()
 		proc.Wait()
@@ -3668,9 +2940,79 @@ func WsConsole(w http.ResponseWriter, r *http.Request) {
 		delete(ptys, pid)
 		ptyMu.Unlock()
 
-		log.Debug("Finished killing minimega console: %v", pid)
+		plog.Debug("killed minimega console", "pid", pid)
 
 	}).ServeHTTP(w, r)
+}
+
+// POST /experiments/{exp}/vms/{name}/cdrom
+func ChangeOpticalDisc(w http.ResponseWriter, r *http.Request) {
+	plog.Debug("HTTP handler called", "handler", "ChangeOpticalDisc")
+
+	var (
+		ctx      = r.Context()
+		role     = ctx.Value("role").(rbac.Role)
+		query    = r.URL.Query()
+		vars     = mux.Vars(r)
+		exp      = vars["exp"]
+		name     = vars["name"]
+		isoPath  = query.Get("isoPath")
+		fullName = exp + "/" + name
+	)
+
+	if !role.Allowed("vms/cdrom", "update", fullName) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if err := vm.ChangeOpticalDisc(exp, name, isoPath); err != nil {
+		plog.Error("changing disc for VM", "exp", exp, "vm", name, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	broker.Broadcast(
+		bt.NewRequestPolicy("vms/cdrom", "update", fullName),
+		bt.NewResource("experiment/vm", fullName, "cdrom-inserted"),
+		nil,
+	)
+
+	w.WriteHeader(http.StatusNoContent)
+
+}
+
+// DELETE /experiments/{exp}/vms/{name}/cdrom
+func EjectOpticalDisc(w http.ResponseWriter, r *http.Request) {
+	plog.Debug("HTTP handler called", "handler", "EjectOpticalDisc")
+
+	var (
+		ctx      = r.Context()
+		role     = ctx.Value("role").(rbac.Role)
+		vars     = mux.Vars(r)
+		exp      = vars["exp"]
+		name     = vars["name"]
+		fullName = exp + "/" + name
+	)
+
+	if !role.Allowed("vms/cdrom", "delete", fullName) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if err := vm.EjectOpticalDisc(exp, name); err != nil {
+		plog.Error("ejecting disc for VM", "exp", exp, "vm", name, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	broker.Broadcast(
+		bt.NewRequestPolicy("vms/cdrom", "delete", fullName),
+		bt.NewResource("experiment/vm", fullName, "cdrom-ejected"),
+		nil,
+	)
+
+	w.WriteHeader(http.StatusNoContent)
+
 }
 
 func parseDuration(v string, d *time.Duration) error {

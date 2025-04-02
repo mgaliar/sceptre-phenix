@@ -14,6 +14,10 @@ import (
 	"phenix/util"
 	"phenix/util/common"
 	"phenix/util/mm"
+	"phenix/util/plog"
+	"phenix/util/pubsub"
+
+	"github.com/mitchellh/mapstructure"
 )
 
 type Startup struct{}
@@ -95,6 +99,15 @@ func (this Startup) PreStart(ctx context.Context, exp *types.Experiment) error {
 			continue
 		}
 
+		// Check to see if a scenario exists for this experiment and if it
+		// contains a "startup" app. If so, store it for later use
+		var startupApp ifaces.ScenarioApp
+		for _, app := range exp.Apps() {
+			if app.Name() == "startup" {
+				startupApp = app
+			}
+		}
+
 		switch strings.ToLower(node.Hardware().OSType()) {
 		case "linux", "rhel", "centos":
 			var (
@@ -134,6 +147,26 @@ func (this Startup) PreStart(ctx context.Context, exp *types.Experiment) error {
 			if err := tmpl.CreateFileFromTemplate("linux_interfaces.tmpl", node, ifaceFile); err != nil {
 				return fmt.Errorf("generating linux interfaces script: %w", err)
 			}
+
+			if startupApp != nil {
+				for _, host := range startupApp.Hosts() {
+					if host.Hostname() == node.General().Hostname() {
+
+						var domainFile = startupDir + "/" + node.General().Hostname() + "-domain.sh"
+
+						node.AddInject(
+							domainFile,
+							"/etc/phenix/startup/4_domain-start.sh",
+							"0755", "",
+						)
+
+						if err := tmpl.CreateFileFromTemplate("linux_domain.tmpl", host.Metadata(), domainFile); err != nil {
+							return fmt.Errorf("generating linux domain script: %w", err)
+						}
+					}
+				}
+			}
+
 		case "windows":
 			startupFile := startupDir + "/" + node.General().Hostname() + "-startup.ps1"
 
@@ -174,15 +207,12 @@ func (this Startup) PreStart(ctx context.Context, exp *types.Experiment) error {
 				Metadata: make(map[string]interface{}),
 			}
 
-			// Check to see if a scenario exists for this experiment and if it
-			// contains a "startup" app. If so, see if this node has a metadata entry
+			// If startup app exists, see if this node has a metadata entry
 			// in the scenario app configuration.
-			for _, app := range exp.Apps() {
-				if app.Name() == "startup" {
-					for _, host := range app.Hosts() {
-						if host.Hostname() == node.General().Hostname() {
-							data.Metadata = host.Metadata()
-						}
+			if startupApp != nil {
+				for _, host := range startupApp.Hosts() {
+					if host.Hostname() == node.General().Hostname() {
+						data.Metadata = host.Metadata()
 					}
 				}
 			}
@@ -214,6 +244,54 @@ func (Startup) PostStart(ctx context.Context, exp *types.Experiment) error {
 
 				if err != nil {
 					return fmt.Errorf("execute C2 command to run Windows startup script: %w", err)
+				}
+			}
+		}
+
+		if annotation, ok := node.GetAnnotation("phenix/startup-autotunnel"); ok {
+			var tunnels []string
+
+			if err := mapstructure.Decode(annotation, &tunnels); err != nil {
+				plog.Error("parsing phenix/startup-autotunnel annotation", "exp", exp.Metadata.Name, "vm", node.General().Hostname(), "err", err)
+			} else {
+				for _, config := range tunnels {
+					tunnel := CreateTunnel{
+						Experiment: exp.Metadata.Name,
+						VM:         node.General().Hostname(),
+						User:       "bot",
+					}
+
+					tokens := strings.Split(config, ":")
+
+					switch len(tokens) {
+					case 1:
+						tunnel.Sport = tokens[0]
+						tunnel.Dhost = "127.0.0.1"
+						tunnel.Dport = tokens[0]
+					case 2:
+						tunnel.Sport = tokens[0]
+						tunnel.Dhost = "127.0.0.1"
+						tunnel.Dport = tokens[1]
+					case 3:
+						tunnel.Sport = tokens[0]
+						tunnel.Dhost = tokens[1]
+						tunnel.Dport = tokens[2]
+					default:
+						plog.Error("invalid phenix/startup-autotunnel annotation", "value", config)
+					}
+
+					if tunnel.Sport != "" {
+						go func(exp, vm string, msg CreateTunnel) {
+							switch strings.ToUpper(msg.Dport) {
+							case "VNC": // doesn't require miniccc agent
+								pubsub.Publish("create-tunnel", msg)
+							default:
+								if err := mm.IsC2ClientActive(mm.C2NS(exp), mm.C2VM(vm)); err == nil {
+									pubsub.Publish("create-tunnel", msg)
+								}
+							}
+						}(exp.Metadata.Name, node.General().Hostname(), tunnel)
+					}
 				}
 			}
 		}

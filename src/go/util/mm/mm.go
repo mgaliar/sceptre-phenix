@@ -19,8 +19,16 @@ type MM interface {
 	GetVMHost(...Option) (string, error)
 	GetVMState(...Option) (string, error)
 
+	SetVMTags(...Option) error
+
 	ConnectVMInterface(...Option) error
 	DisconnectVMInterface(...Option) error
+
+	CreateBridge(...Option) error
+
+	CreateTunnel(...Option) error
+	GetTunnels(...Option) []map[string]string
+	CloseTunnel(...Option) error
 
 	StartVMCapture(...Option) error
 	StopVMCapture(...Option) error
@@ -28,8 +36,10 @@ type MM interface {
 	GetVMCaptures(...Option) []Capture
 
 	GetClusterHosts(bool) (Hosts, error)
+	GetNamespaceHosts(string) (Hosts, error)
 	Headnode() string
 	IsHeadnode(string) bool
+	GetMMArgs() (map[string]string, error)
 	GetVLANs(...Option) (map[string]int, error)
 
 	IsC2ClientActive(...C2Option) error
@@ -40,5 +50,6 @@ type MM interface {
 
 	TapVLAN(...TapOption) error
 	MeshShell(string, string) error
+	MeshShellResponse(string, string) (string, error)
 	MeshSend(string, string, string) error
 }

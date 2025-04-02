@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,8 +17,8 @@ import (
 
 	"phenix/util/common"
 	"phenix/util/mm/mmcli"
+	"phenix/util/plog"
 
-	log "github.com/activeshadow/libminimega/minilog"
 	"github.com/hashicorp/go-multierror"
 )
 
@@ -139,7 +140,7 @@ func (this Minimega) GetVMInfo(opts ...Option) VMs {
 
 	cmd := mmcli.NewNamespacedCommand(o.ns)
 	cmd.Command = "vm info"
-	cmd.Columns = []string{"uuid", "host", "name", "state", "uptime", "vlan", "tap", "ip", "memory", "vcpus", "disks", "snapshot", "tags"}
+	cmd.Columns = []string{"uuid", "host", "name", "state", "uptime", "vlan", "tap", "ip", "memory", "vcpus", "disks", "snapshot", "cdrom", "tags"}
 
 	if o.vm != "" {
 		cmd.Filters = []string{"name=" + o.vm}
@@ -155,6 +156,7 @@ func (this Minimega) GetVMInfo(opts ...Option) VMs {
 			State:    row["state"],
 			Running:  row["state"] == "RUNNING",
 			CCActive: activeC2[row["uuid"]],
+			CdRom:    row["cdrom"],
 		}
 
 		s := row["vlan"]
@@ -182,12 +184,9 @@ func (this Minimega) GetVMInfo(opts ...Option) VMs {
 		}
 
 		s = row["tags"]
-		s = strings.TrimPrefix(s, "{")
-		s = strings.TrimSuffix(s, "}")
-
-		if s != "" {
-			vm.Tags = strings.Split(s, ",")
-		}
+		var tags map[string]string
+		json.Unmarshal([]byte(s), &tags)
+		vm.Tags = tags
 
 		// Make sure the VM name is set prior to calling `GetVMCaptures`, as the VM
 		// name is not always set when calling `GetVMInfo`.
@@ -213,14 +212,23 @@ func (this Minimega) GetVMInfo(opts ...Option) VMs {
 			cmd = mmcli.NewCommand()
 			cmd.Command = "disk info " + disk
 
-			// Only expect one row returned
-			// TODO (btr): check length to avoid a panic.
-			resp := mmcli.RunTabular(cmd)[0]
+			if !IsHeadnode(row["host"]) {
+				cmd.Command = fmt.Sprintf("mesh send %s %s", row["host"], cmd.Command)
+			}
 
-			if resp["backingfile"] == "" {
-				vm.Disk = resp["image"]
+			resp := mmcli.RunTabular(cmd)
+
+			if len(resp) == 0 {
+				vm.Disk = disk
 			} else {
-				vm.Disk = resp["backingfile"]
+				// Only expect one row returned
+				info := resp[0]
+
+				if info["backingfile"] == "" {
+					vm.Disk = info["image"]
+				} else {
+					vm.Disk = info["backingfile"]
+				}
 			}
 		} else {
 			// Attempting to get disk info when not using a snapshot will cause a
@@ -476,6 +484,27 @@ func (Minimega) GetVMState(opts ...Option) (string, error) {
 	return status[0]["state"], nil
 }
 
+func (Minimega) SetVMTags(opts ...Option) error {
+	o := NewOptions(opts...)
+
+	cmd := mmcli.NewNamespacedCommand(o.ns)
+	cmd.Command = fmt.Sprintf("clear vm tag %s ", o.vm)
+
+	if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+		return fmt.Errorf("failed to clear tags for vm %s: %w", o.vm, err)
+	}
+
+	for k, v := range o.tags {
+		cmd.Command = fmt.Sprintf("vm tag %s \"%s\" \"%s\"", o.vm, k, v)
+
+		if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+			return fmt.Errorf("failed to set tag for vm %s: %s=%s %w", o.vm, k, v, err)
+		}
+	}
+
+	return nil
+}
+
 func (Minimega) ConnectVMInterface(opts ...Option) error {
 	o := NewOptions(opts...)
 
@@ -500,6 +529,95 @@ func (Minimega) DisconnectVMInterface(opts ...Option) error {
 	}
 
 	return nil
+}
+
+func (Minimega) CreateBridge(opts ...Option) error {
+	o := NewOptions(opts...)
+
+	cmd := mmcli.NewNamespacedCommand(o.ns)
+	cmd.Command = fmt.Sprintf("ns bridge %s gre", o.bridge)
+
+	if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+		return fmt.Errorf("creating bridge %s with GRE mesh between namespace hosts: %w", o.bridge, err)
+	}
+
+	return nil
+}
+
+func (Minimega) CreateTunnel(opts ...Option) error {
+	host, err := GetVMHost(opts...)
+	if err != nil {
+		return fmt.Errorf("unable to determine what host the VM is scheduled on: %w", err)
+	}
+
+	o := NewOptions(opts...)
+
+	var cmdPrefix string
+
+	if !IsHeadnode(host) {
+		cmdPrefix = fmt.Sprintf("mesh send %s namespace %s", host, o.ns)
+	}
+
+	cmd := mmcli.NewNamespacedCommand(o.ns)
+	cmd.Command = fmt.Sprintf("%s cc tunnel %s %d %s %d", cmdPrefix, o.vm, o.srcPort, o.dstHost, o.dstPort)
+
+	if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+		return fmt.Errorf("creating tunnel to %s (%d:%s:%d): %w", o.vm, o.srcPort, o.dstHost, o.dstPort, err)
+	}
+
+	return nil
+}
+
+func (Minimega) GetTunnels(opts ...Option) []map[string]string {
+	o := NewOptions(opts...)
+
+	cmd := mmcli.NewNamespacedCommand(o.ns)
+	cmd.Command = "cc tunnel list all"
+
+	if o.vm != "" {
+		cmd.Command = fmt.Sprintf("cc tunnel list %s", o.vm)
+	}
+
+	if o.dstHost != "" {
+		cmd.Filters = append(cmd.Filters, fmt.Sprintf("dst=%s", o.dstHost))
+	}
+
+	if o.dstPort != 0 {
+		cmd.Filters = append(cmd.Filters, fmt.Sprintf("'dst port'=%d", o.dstPort))
+	}
+
+	return mmcli.RunTabular(cmd)
+}
+
+func (Minimega) CloseTunnel(opts ...Option) error {
+	tunnels := GetTunnels(opts...)
+
+	host, err := GetVMHost(opts...)
+	if err != nil {
+		return fmt.Errorf("unable to determine what host the VM is scheduled on: %w", err)
+	}
+
+	o := NewOptions(opts...)
+
+	var (
+		cmdPrefix string
+		errs      error
+	)
+
+	if !IsHeadnode(host) {
+		cmdPrefix = fmt.Sprintf("mesh send %s namespace %s", host, o.ns)
+	}
+
+	for _, row := range tunnels {
+		cmd := mmcli.NewNamespacedCommand(o.ns)
+		cmd.Command = fmt.Sprintf("%s cc tunnel close %s %s", cmdPrefix, o.vm, row["id"])
+
+		if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
+			errs = multierror.Append(errs, fmt.Errorf("closing tunnel to %s (%s:%d): %w", o.vm, o.dstHost, o.dstPort, err))
+		}
+	}
+
+	return errs
 }
 
 func (Minimega) StartVMCapture(opts ...Option) error {
@@ -617,7 +735,7 @@ func (this Minimega) GetVMCaptures(opts ...Option) []Capture {
 	return keep
 }
 
-func (Minimega) GetClusterHosts(schedOnly bool) (Hosts, error) {
+func (this Minimega) GetClusterHosts(schedOnly bool) (Hosts, error) {
 	// Get headnode details
 	hosts, err := processNamespaceHosts("minimega")
 	if err != nil {
@@ -655,6 +773,10 @@ func (Minimega) GetClusterHosts(schedOnly bool) (Hosts, error) {
 		host.Name = common.TrimHostnameSuffixes(host.Name)
 		host.Schedulable = true
 
+		// Add disk info
+		host.DiskUsage.Phenix = this.getDiskUsage(host.Name, common.PhenixBase)
+		host.DiskUsage.Minimega = this.getDiskUsage(host.Name, common.MinimegaBase)
+
 		cluster = append(cluster, host)
 	}
 
@@ -664,9 +786,35 @@ func (Minimega) GetClusterHosts(schedOnly bool) (Hosts, error) {
 
 	head.Name = common.TrimHostnameSuffixes(head.Name)
 
+	// Add disk info
+	head.DiskUsage.Phenix = this.getDiskUsage(head.Name, common.PhenixBase)
+	head.DiskUsage.Minimega = this.getDiskUsage(head.Name, common.MinimegaBase)
+
 	cluster = append(cluster, head)
 
 	return cluster, nil
+}
+
+func (this Minimega) GetNamespaceHosts(ns string) (Hosts, error) {
+	var hosts []Host
+
+	// Get namespace nodes details
+	processed, err := processNamespaceHosts(ns)
+	if err != nil {
+		return nil, fmt.Errorf("processing namespace nodes details: %w", err)
+	}
+
+	for _, host := range processed {
+		host.Name = common.TrimHostnameSuffixes(host.Name)
+
+		// Add disk info
+		host.DiskUsage.Phenix = this.getDiskUsage(host.Name, common.PhenixBase)
+		host.DiskUsage.Minimega = this.getDiskUsage(host.Name, common.MinimegaBase)
+
+		hosts = append(hosts, host)
+	}
+
+	return hosts, nil
 }
 
 func (Minimega) Headnode() string {
@@ -690,6 +838,16 @@ func (this Minimega) IsHeadnode(node string) bool {
 	node = common.TrimHostnameSuffixes(node)
 
 	return node == this.Headnode()
+}
+
+func (this Minimega) GetMMArgs() (map[string]string, error) {
+	cmd := mmcli.NewCommand()
+	cmd.Command = "args"
+	rows := mmcli.RunTabular(cmd)
+	if len(rows) == 1 {
+		return rows[0], nil
+	}
+	return nil, fmt.Errorf("no args returned")
 }
 
 func (Minimega) GetVLANs(opts ...Option) (map[string]int, error) {
@@ -970,7 +1128,7 @@ func (this Minimega) TapVLAN(opts ...TapOption) error {
 	o := NewTapOptions(opts...)
 
 	if o.untap {
-		log.Info("deleting tap %s from host %s", o.name, o.host)
+		plog.Info("deleting tap from host", "tap", o.name, "host", o.host)
 
 		var errs error
 
@@ -980,7 +1138,7 @@ func (this Minimega) TapVLAN(opts ...TapOption) error {
 		}
 
 		if o.netns != "" {
-			log.Info("deleting network namespace %s from host %s", o.netns, o.host)
+			plog.Info("deleting network namespace from host", "ns", o.netns, "host", o.host)
 
 			cmd := fmt.Sprintf("ip netns delete %s", o.netns)
 			if err := this.MeshShell(o.host, cmd); err != nil {
@@ -991,7 +1149,7 @@ func (this Minimega) TapVLAN(opts ...TapOption) error {
 		return errs
 	}
 
-	log.Info("creating tap %s (tapping VLAN %s on bridge %s) on host %s", o.name, o.vlan, o.bridge, o.host)
+	plog.Info("creating tap on host", "tap", o.name, "vlan", o.vlan, "bridge", o.bridge, "host", o.host)
 
 	var cmd string
 
@@ -1012,21 +1170,21 @@ func (this Minimega) TapVLAN(opts ...TapOption) error {
 	}
 
 	if o.netns != "" {
-		log.Info("creating network namespace for tap %s on host %s", o.name, o.host)
+		plog.Info("creating network namespace for tap on host", "tap", o.name, "host", o.host)
 
 		cmd := fmt.Sprintf("ip netns add %s", o.name)
 		if err := this.MeshShell(o.host, cmd); err != nil {
 			return fmt.Errorf("creating network namespace on host %s: %w", o.host, err)
 		}
 
-		log.Info("moving tap %s to network namespace on host %s", o.name, o.host)
+		plog.Info("moving tap to network namespace on host", "tap", o.name, "host", o.host)
 
 		cmd = fmt.Sprintf("ip link set dev %s netns %s", o.name, o.name)
 		if err := this.MeshShell(o.host, cmd); err != nil {
 			return fmt.Errorf("moving tap to network namespace on host %s: %w", o.host, err)
 		}
 
-		log.Info("bringing tap %s up in network namespace on host %s", o.name, o.host)
+		plog.Info("bringing tap up in network namespace on host", "tap", o.name, "host", o.host)
 
 		cmd = fmt.Sprintf("ip netns exec %s ip link set dev %s up", o.name, o.name)
 		if err := this.MeshShell(o.host, cmd); err != nil {
@@ -1034,7 +1192,7 @@ func (this Minimega) TapVLAN(opts ...TapOption) error {
 		}
 
 		if o.ip != "" {
-			log.Info("setting IP address for tap %s in network namespace on host %s", o.name, o.host)
+			plog.Info("setting IP address for tap in network namespace on host", "tap", o.name, "host", o.host)
 
 			cmd := fmt.Sprintf("ip netns exec %s ip addr add %s dev %s", o.name, o.ip, o.name)
 			if err := this.MeshShell(o.host, cmd); err != nil {
@@ -1059,13 +1217,38 @@ func (Minimega) MeshShell(host, command string) error {
 		cmd.Command = fmt.Sprintf("mesh send %s shell %s", host, command)
 	}
 
-	log.Debug("SHELL: " + cmd.Command)
-
 	if err := mmcli.ErrorResponse(mmcli.Run(cmd)); err != nil {
 		return fmt.Errorf("running shell command (host %s) %s: %w", host, command, err)
 	}
 
 	return nil
+}
+
+func (Minimega) MeshShellResponse(host, command string) (string, error) {
+	cmd := mmcli.NewCommand()
+
+	if host == "" {
+		host = Headnode()
+	}
+
+	if IsHeadnode(host) {
+		cmd.Command = fmt.Sprintf("shell %s", command)
+	} else {
+		cmd.Command = fmt.Sprintf("mesh send %s shell %s", host, command)
+	}
+
+	for resps := range mmcli.Run(cmd) {
+		for _, resp := range resps.Resp {
+			if resp.Error != "" {
+				plog.Warn("error running shell command: ", "cmd", cmd)
+				continue
+			}
+
+			return strings.TrimSpace(resp.Response), nil
+		}
+	}
+
+	return "", fmt.Errorf("error running MeshShellResponse()")
 }
 
 func (Minimega) MeshSend(ns, host, command string) error {
@@ -1240,4 +1423,20 @@ func processNamespaceHosts(namespace string) (Hosts, error) {
 	}
 
 	return hosts, nil
+}
+
+// Run shell command to get disk usage for `path` on `host`
+func (this Minimega) getDiskUsage(host string, path string) float64 {
+	diskUsage := 0.0
+
+	cmd := fmt.Sprintf(`bash -c "echo $(df %s | awk '{print $(NF-1)}' | tail -1)"`, path)
+	resp, err := this.MeshShellResponse(host, cmd)
+
+	if (resp == "") || (err != nil) {
+		return diskUsage
+	}
+
+	diskUsage, _ = strconv.ParseFloat(strings.TrimSuffix(resp, "%"), 64)
+
+	return diskUsage
 }

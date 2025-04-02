@@ -15,12 +15,13 @@ import (
 	"phenix/types"
 	"phenix/util/mm"
 	"phenix/util/notes"
+	"phenix/util/plog"
 	"phenix/web/broker"
 	"phenix/web/cache"
 	"phenix/web/util"
 	"phenix/web/weberror"
 
-	log "github.com/activeshadow/libminimega/minilog"
+	bt "phenix/web/broker/brokertypes"
 )
 
 var (
@@ -38,8 +39,8 @@ func startExperiment(name string) ([]byte, error) {
 	defer cache.UnlockExperiment(name)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("experiments/start", "update", name),
-		broker.NewResource("experiment", name, "starting"),
+		bt.NewRequestPolicy("experiments/start", "update", name),
+		bt.NewResource("experiment", name, "starting"),
 		nil,
 	)
 
@@ -66,7 +67,7 @@ func startExperiment(name string) ([]byte, error) {
 			status <- result{nil, err}
 		} else {
 			for _, note := range notes.Info(ctx, false) {
-				log.Info(note)
+				plog.Info(note)
 			}
 
 			done := make(chan struct{})
@@ -76,7 +77,7 @@ func startExperiment(name string) ([]byte, error) {
 			go func() {
 				for {
 					for _, note := range notes.Info(ctx, false) {
-						log.Info(note)
+						plog.Info(note)
 					}
 
 					select {
@@ -90,14 +91,14 @@ func startExperiment(name string) ([]byte, error) {
 
 			go func() {
 				for err := range ch {
-					log.Warn("delayed error starting experiment %s: %v", name, err)
+					plog.Warn("delayed error starting experiment", "exp", name, "err", err)
 
 					var delayErr experiment.DelayedVMError
 
 					if errors.As(err, &delayErr) {
 						broker.Broadcast(
-							broker.NewRequestPolicy("experiments/start", "update", name),
-							broker.NewResource("experiment/vm", fmt.Sprintf("%s/%s", name, delayErr.VM), "error"),
+							bt.NewRequestPolicy("experiments/start", "update", name),
+							bt.NewResource("experiment/vm", fmt.Sprintf("%s/%s", name, delayErr.VM), "error"),
 							json.RawMessage(fmt.Sprintf(`{"error": "unable to start delayed VM %s"}`, delayErr.VM)),
 						)
 					}
@@ -121,8 +122,8 @@ func startExperiment(name string) ([]byte, error) {
 		case s := <-status:
 			if s.err != nil {
 				broker.Broadcast(
-					broker.NewRequestPolicy("experiments/start", "update", name),
-					broker.NewResource("experiment", name, "errorStarting"),
+					bt.NewRequestPolicy("experiments/start", "update", name),
+					bt.NewResource("experiment", name, "errorStarting"),
 					nil,
 				)
 
@@ -148,7 +149,7 @@ func startExperiment(name string) ([]byte, error) {
 			vms, err := vm.List(name)
 			if err != nil {
 				// TODO
-				log.Error("listing VMs in experiment %s - %v", name, err)
+				plog.Error("listing VMs in experiment", "exp", name, "err", err)
 			}
 
 			body, err := marshaler.Marshal(util.ExperimentToProtobuf(*s.exp, "", vms))
@@ -158,8 +159,8 @@ func startExperiment(name string) ([]byte, error) {
 			}
 
 			broker.Broadcast(
-				broker.NewRequestPolicy("experiments/start", "update", name),
-				broker.NewResource("experiment", name, "start"),
+				bt.NewRequestPolicy("experiments/start", "update", name),
+				bt.NewResource("experiment", name, "start"),
 				body,
 			)
 
@@ -167,7 +168,7 @@ func startExperiment(name string) ([]byte, error) {
 		default:
 			p, err := mm.GetLaunchProgress(name, count)
 			if err != nil {
-				log.Error("getting progress for experiment %s - %v", name, err)
+				plog.Error("getting progress for experiment", "exp", name, "err", err)
 				continue
 			}
 
@@ -175,7 +176,7 @@ func startExperiment(name string) ([]byte, error) {
 				progress = p
 			}
 
-			log.Info("percent deployed: %v", progress*100.0)
+			plog.Info("percent deployed", "percent", progress*100.0)
 
 			status := map[string]interface{}{
 				"percent": progress,
@@ -184,8 +185,8 @@ func startExperiment(name string) ([]byte, error) {
 			marshalled, _ := json.Marshal(status)
 
 			broker.Broadcast(
-				broker.NewRequestPolicy("experiments/start", "update", name),
-				broker.NewResource("experiment", name, "progress"),
+				bt.NewRequestPolicy("experiments/start", "update", name),
+				bt.NewResource("experiment", name, "progress"),
 				marshalled,
 			)
 
@@ -203,8 +204,8 @@ func stopExperiment(name string) ([]byte, error) {
 	defer cache.UnlockExperiment(name)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("experiments/stop", "update", name),
-		broker.NewResource("experiment", name, "stopping"),
+		bt.NewRequestPolicy("experiments/stop", "update", name),
+		bt.NewResource("experiment", name, "stopping"),
 		nil,
 	)
 
@@ -223,8 +224,8 @@ func stopExperiment(name string) ([]byte, error) {
 
 	if err := experiment.Stop(name); err != nil {
 		broker.Broadcast(
-			broker.NewRequestPolicy("experiments/stop", "update", name),
-			broker.NewResource("experiment", name, "errorStopping"),
+			bt.NewRequestPolicy("experiments/stop", "update", name),
+			bt.NewResource("experiment", name, "errorStopping"),
 			nil,
 		)
 
@@ -249,8 +250,8 @@ func stopExperiment(name string) ([]byte, error) {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("experiments/stop", "update", name),
-		broker.NewResource("experiment", name, "stop"),
+		bt.NewRequestPolicy("experiments/stop", "update", name),
+		bt.NewResource("experiment", name, "stop"),
 		body,
 	)
 

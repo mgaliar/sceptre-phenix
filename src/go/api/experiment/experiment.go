@@ -2,6 +2,7 @@ package experiment
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -23,11 +24,17 @@ import (
 	"phenix/util/mm"
 	"phenix/util/mm/mmcli"
 	"phenix/util/notes"
+	"phenix/util/plog"
 	"phenix/util/pubsub"
 
 	"github.com/activeshadow/structs"
 	"github.com/hashicorp/go-multierror"
 	"github.com/mitchellh/mapstructure"
+)
+
+var (
+	ErrExperimentNotFound   = errors.New("experiment not found")
+	ErrExperimentNotRunning = errors.New("experiment not running")
 )
 
 func init() {
@@ -38,11 +45,52 @@ func init() {
 		}
 
 		switch stage {
+		case "startup":
+			// Experiments created before the default bridge option was added need to
+			// be updated to have a default `phenix` bridge.
+			if exp.Spec.DefaultBridge() == "" {
+				exp.Spec.SetDefaultBridge("phenix")
+
+				if err := exp.Spec.Init(); err != nil {
+					return fmt.Errorf("re-initializing experiment with default bridge: %w", err)
+				}
+
+				c.Spec = structs.MapDefaultCase(exp.Spec, structs.CASESNAKE)
+			}
 		case "create":
 			exp.Spec.SetExperimentName(c.Metadata.Name)
 
 			if err := exp.Spec.Init(); err != nil {
 				return fmt.Errorf("initializing experiment: %w", err)
+			}
+
+			if common.BridgeMode == common.BRIDGE_MODE_AUTO {
+				if len(c.Metadata.Name) > 15 {
+					return fmt.Errorf("experiment name must be 15 characters or less when using auto bridge mode")
+				}
+
+				exp.Spec.SetDefaultBridge(c.Metadata.Name)
+			}
+
+			if len(exp.Spec.DefaultBridge()) > 15 {
+				return fmt.Errorf("default bridge name must be 15 characters or less")
+			}
+
+			exp.Spec.SetUseGREMesh(exp.Spec.UseGREMesh() || common.UseGREMesh)
+
+			existing, _ := types.Experiments(false)
+			for _, other := range existing {
+				if other.Metadata.Name == exp.Metadata.Name {
+					continue
+				}
+
+				if exp.Spec.DefaultBridge() == "phenix" {
+					continue
+				}
+
+				if other.Spec.DefaultBridge() == exp.Spec.DefaultBridge() {
+					return fmt.Errorf("experiment %s already using default bridge %s", other.Metadata.Name, other.Spec.DefaultBridge())
+				}
 			}
 
 			if err := exp.Spec.VerifyScenario(context.TODO()); err != nil {
@@ -62,6 +110,36 @@ func init() {
 
 			if err := exp.Spec.Init(); err != nil {
 				return fmt.Errorf("re-initializing experiment (after update): %w", err)
+			}
+
+			// Just in case the updated experiment reset the default bridge.
+			if common.BridgeMode == common.BRIDGE_MODE_AUTO {
+				if len(c.Metadata.Name) > 15 {
+					return fmt.Errorf("experiment name must be 15 characters or less when using auto bridge mode")
+				}
+
+				exp.Spec.SetDefaultBridge(c.Metadata.Name)
+			}
+
+			if len(exp.Spec.DefaultBridge()) > 15 {
+				return fmt.Errorf("default bridge name must be 15 characters or less")
+			}
+
+			exp.Spec.SetUseGREMesh(exp.Spec.UseGREMesh() || common.UseGREMesh)
+
+			existing, _ := types.Experiments(false)
+			for _, other := range existing {
+				if other.Metadata.Name == exp.Metadata.Name {
+					continue
+				}
+
+				if exp.Spec.DefaultBridge() == "phenix" {
+					continue
+				}
+
+				if other.Spec.DefaultBridge() == exp.Spec.DefaultBridge() {
+					return fmt.Errorf("experiment %s already using default bridge %s", other.Metadata.Name, other.Spec.DefaultBridge())
+				}
 			}
 
 			if exp.Spec.ExperimentName() != c.Metadata.Name {
@@ -182,6 +260,10 @@ func Create(ctx context.Context, opts ...CreateOption) error {
 		return fmt.Errorf("no topology name provided")
 	}
 
+	if len(o.defaultBridge) > 15 {
+		return fmt.Errorf("default bridge name must be 15 characters or less")
+	}
+
 	var (
 		kind       = "Experiment"
 		apiVersion = version.StoredVersion[kind]
@@ -206,10 +288,16 @@ func Create(ctx context.Context, opts ...CreateOption) error {
 		},
 	}
 
-	specMap := map[string]interface{}{
+	specMap := map[string]any{
 		"experimentName": o.name,
 		"baseDir":        o.baseDir,
+		"deployMode":     o.deployMode,
+		"defaultBridge":  o.defaultBridge,
 		"topology":       topo,
+	}
+
+	if o.disabledApps != nil {
+		plog.Info(fmt.Sprintf("Got disabled applications: %v", o.disabledApps))
 	}
 
 	if o.scenario != "" {
@@ -229,7 +317,8 @@ func Create(ctx context.Context, opts ...CreateOption) error {
 		}
 
 		// This will upgrade the scenario to the latest known version if needed.
-		scenario, err := types.DecodeScenarioFromConfig(*scenarioC)
+		plog.Info("Creating custom scenario")
+		scenario, err := types.MakeCustomScenarioFromConfig(*scenarioC, o.disabledApps)
 		if err != nil {
 			return fmt.Errorf("decoding scenario from config: %w", err)
 		}
@@ -263,6 +352,9 @@ func Create(ctx context.Context, opts ...CreateOption) error {
 	exp.Spec.SetVLANRange(o.vlanMin, o.vlanMax, false)
 	exp.Spec.VLANs().SetAliases(o.vlanAliases)
 	exp.Spec.SetSchedule(o.schedules)
+	exp.Spec.SetUseGREMesh(o.useGREMesh)
+
+	c.Spec = structs.MapDefaultCase(exp.Spec, structs.CASESNAKE)
 
 	if _, err := config.Create(config.CreateFromConfig(c), config.CreateWithValidation()); err != nil {
 		return fmt.Errorf("creating experiment config: %w", err)
@@ -457,6 +549,26 @@ func Start(ctx context.Context, opts ...StartOption) error {
 				notes.AddWarnings(ctx, false, merr.Errors...)
 			} else {
 				notes.AddWarnings(ctx, false, err)
+			}
+		}
+
+		// Creating experiment bridge after launching VMs to ensure the bridge
+		// already exists in minimega (and OVS) before creating GRE tunnels between
+		// them. This cannot be done as part of the minimega script template since
+		// the VM taps (and thus bridges) do not get created until the overall
+		// minimega namespace is launched.
+		if exp.Spec.UseGREMesh() {
+			if err := mm.CreateBridge(mm.NS(exp.Metadata.Name), mm.Bridge(exp.Spec.DefaultBridge())); err != nil {
+				if !o.mmErrAsWarn {
+					mm.ClearNamespace(exp.Spec.ExperimentName())
+					return fmt.Errorf("creating experiment bridge: %w", err)
+				}
+
+				if merr, ok := err.(*multierror.Error); ok {
+					notes.AddWarnings(ctx, false, merr.Errors...)
+				} else {
+					notes.AddWarnings(ctx, false, err)
+				}
 			}
 		}
 
@@ -718,6 +830,13 @@ func Reconfigure(name string) error {
 
 	if err := config.Update(c.FullName(), c); err != nil {
 		return fmt.Errorf("updating experiment config: %w", err)
+	}
+
+	// Try deleting the minimega bridge associated with this experiment if we're
+	// not using the GRE mesh, just in case we were using it prior. Ignore any
+	// errors since they will occur if GRE wasn't being used.
+	if !exp.Spec.UseGREMesh() {
+		mm.MeshSend(name, "", fmt.Sprintf("ns del-bridge %s", exp.Spec.DefaultBridge()))
 	}
 
 	return nil

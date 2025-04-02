@@ -13,19 +13,22 @@ import (
 	"phenix/store"
 	"phenix/types"
 	"phenix/types/version"
+	"phenix/util/common"
+	"phenix/util/plog"
 	"phenix/web/broker"
 	"phenix/web/cache"
 	"phenix/web/rbac"
 	"phenix/web/weberror"
 
-	log "github.com/activeshadow/libminimega/minilog"
+	bt "phenix/web/broker/brokertypes"
+
 	"github.com/gorilla/mux"
 	"github.com/mitchellh/mapstructure"
 )
 
 // POST /workflow/apply/{branch}
 func ApplyWorkflow(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("ApplyWorkflow HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "ApplyWorkflow")
 
 	var (
 		ctx   = r.Context()
@@ -135,6 +138,9 @@ func ApplyWorkflow(w http.ResponseWriter, r *http.Request) error {
 			experiment.CreateWithSchedules(wf.Schedules),
 			experiment.CreateWithVLANMin(wf.VLANMin()),
 			experiment.CreateWithVLANMax(wf.VLANMax()),
+			experiment.CreateWithDeployMode(wf.ExperimentDeployMode()),
+			experiment.CreateWithDefaultBridge(wf.DefaultBridgeName()),
+			experiment.CreateWithGREMesh(wf.UseGREMesh),
 		}
 
 		if err := experiment.Create(ctx, opts...); err != nil {
@@ -299,8 +305,20 @@ func ApplyWorkflow(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 
+		if len(wf.DefaultBridgeName()) > 15 {
+			err := weberror.NewWebError(
+				fmt.Errorf("default bridge name must be 15 characters or less"),
+				"unable to set default bridge for experiment %s", expName,
+			)
+
+			return err.SetStatus(http.StatusBadRequest)
+		}
+
+		exp.Spec.SetDefaultBridge(wf.DefaultBridgeName())
 		exp.Spec.SetSchedule(schedules)
+		exp.Spec.SetDeployMode(string(wf.ExperimentDeployMode()))
 		exp.Spec.SetVLANRange(wf.VLANMin(), wf.VLANMax(), true)
+		exp.Spec.SetUseGREMesh(wf.UseGREMesh)
 
 		if err := exp.WriteToStore(false); err != nil {
 			err := weberror.NewWebError(err, "unable to write updated experiment %s", expName)
@@ -328,7 +346,7 @@ func ApplyWorkflow(w http.ResponseWriter, r *http.Request) error {
 
 // POST /workflow/configs/{branch}
 func WorkflowUpsertConfig(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("WorkflowUpsertConfig HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "WorkflowUpsertConfig")
 
 	var (
 		ctx   = r.Context()
@@ -370,7 +388,7 @@ func WorkflowUpsertConfig(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	var (
-		name      = strings.ToLower(fmt.Sprintf("%s/%s", cfg.Kind, cfg.Metadata.Name))
+		name      = fmt.Sprintf("%s/%s", cfg.Kind, cfg.Metadata.Name)
 		tester, _ = store.NewConfig(name)
 		exists    = true
 	)
@@ -454,13 +472,13 @@ func WorkflowUpsertConfig(w http.ResponseWriter, r *http.Request) error {
 
 	body, err := json.Marshal(cfg)
 	if err != nil {
-		log.Error("marshaling config %s - %v", cfg.FullName(), err)
+		plog.Error("marshaling config", "config", cfg.FullName(), "err", err)
 		return nil
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("configs", "list", cfg.FullName()),
-		broker.NewResource("config", cfg.FullName(), "create"),
+		bt.NewRequestPolicy("configs", "list", cfg.FullName()),
+		bt.NewResource("config", cfg.FullName(), "create"),
 		body,
 	)
 
@@ -474,15 +492,19 @@ type workflow struct {
 		Restart *bool  `mapstructure:"restart"`
 	} `mapstructure:"auto"`
 
-	Topology  string            `mapstructure:"topology"`
-	Scenario  string            `mapstructure:"scenario"`
-	VLANs     map[string]int    `mapstructure:"vlans"`
-	Schedules map[string]string `mapstructue:"schedules"`
+	Topology   string            `mapstructure:"topology"`
+	Scenario   string            `mapstructure:"scenario"`
+	VLANs      map[string]int    `mapstructure:"vlans"`
+	Schedules  map[string]string `mapstructue:"schedules"`
+	DeployMode string            `mapstructure:"deployMode"`
+	UseGREMesh bool              `mapstructure:"useGREMesh"`
 
 	VLANRange *struct {
 		Min int `mapstructure:"min"`
 		Max int `mapstructure:"max"`
 	} `mapstructure:"vlanRange"`
+
+	DefaultBridge string `mapstructure:"defaultBridge"`
 }
 
 func (this workflow) AutoUpdate() bool {
@@ -541,6 +563,15 @@ func (this workflow) ScheduleMappings() map[string]string {
 	return this.Schedules
 }
 
+func (this workflow) ExperimentDeployMode() common.DeploymentMode {
+	mode, err := common.ParseDeployMode(this.DeployMode)
+	if err != nil { // this will happen if deploy mode isn't provided in workflow config
+		return common.DeployMode
+	}
+
+	return mode
+}
+
 func (this workflow) VLANMin() int {
 	if this.VLANRange == nil {
 		return 0
@@ -555,4 +586,12 @@ func (this workflow) VLANMax() int {
 	}
 
 	return this.VLANRange.Max
+}
+
+func (this workflow) DefaultBridgeName() string {
+	if this.DefaultBridge == "" {
+		return "phenix"
+	}
+
+	return this.DefaultBridge
 }

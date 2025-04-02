@@ -5,18 +5,13 @@ import (
 	"time"
 )
 
-type Font struct {
-	Color string `json:"color"`
-	Align string `json:"align"`
-}
-
 type Node struct {
-	ID     int        `json:"id"`
-	Label  string     `json:"label"`
-	Image  string     `json:"image"`
-	Fonts  Font       `json:"font"`
-	Status string     `json:"status"`
-	SOH    *HostState `json:"soh"`
+	ID     int               `json:"id"`
+	Label  string            `json:"label"`
+	Image  string            `json:"image"`
+	Tags   map[string]string `json:"tags"`
+	Status string            `json:"status"`
+	SOH    *HostState        `json:"soh"`
 }
 
 type Edge struct {
@@ -27,11 +22,13 @@ type Edge struct {
 }
 
 type Network struct {
-	Started   bool     `json:"started"`
-	Nodes     []Node   `json:"nodes"`
-	Edges     []Edge   `json:"edges"`
-	Hosts     []string `json:"hosts"`
-	HostFlows [][]int  `json:"host_flows"`
+	ExpStarted     bool     `json:"started"`
+	SOHInitialized bool     `json:"soh_initialized"`
+	SOHRunning     bool     `json:"soh_running"`
+	Nodes          []Node   `json:"nodes"`
+	Edges          []Edge   `json:"edges"`
+	Hosts          []string `json:"hosts"`
+	HostFlows      [][]int  `json:"host_flows"`
 }
 
 type State struct {

@@ -8,19 +8,26 @@ import (
 type CreateOption func(*createOptions)
 
 type createOptions struct {
-	name        string
-	annotations map[string]string
-	topology    string
-	scenario    string
-	vlanMin     int
-	vlanMax     int
-	vlanAliases map[string]int
-	schedules   map[string]string
-	baseDir     string
+	name          string
+	annotations   map[string]string
+	topology      string
+	scenario      string
+	disabledApps  []string
+	vlanMin       int
+	vlanMax       int
+	vlanAliases   map[string]int
+	schedules     map[string]string
+	baseDir       string
+	deployMode    common.DeploymentMode
+	useGREMesh    bool
+	defaultBridge string
 }
 
 func newCreateOptions(opts ...CreateOption) createOptions {
-	var o createOptions
+	o := createOptions{
+		deployMode: common.DeployMode,
+		useGREMesh: common.UseGREMesh,
+	}
 
 	for _, opt := range opts {
 		opt(&o)
@@ -28,6 +35,10 @@ func newCreateOptions(opts ...CreateOption) createOptions {
 
 	if o.baseDir == "" {
 		o.baseDir = common.PhenixBase + "/experiments/" + o.name
+	}
+
+	if o.defaultBridge == "" {
+		o.defaultBridge = "phenix"
 	}
 
 	return o
@@ -54,6 +65,12 @@ func CreateWithTopology(t string) CreateOption {
 func CreateWithScenario(s string) CreateOption {
 	return func(o *createOptions) {
 		o.scenario = s
+	}
+}
+
+func CreatedWithDisabledApplications(a []string) CreateOption {
+	return func(o *createOptions) {
+		o.disabledApps = a
 	}
 }
 
@@ -84,6 +101,25 @@ func CreateWithSchedules(s map[string]string) CreateOption {
 func CreateWithBaseDirectory(b string) CreateOption {
 	return func(o *createOptions) {
 		o.baseDir = b
+	}
+}
+
+func CreateWithDeployMode(m common.DeploymentMode) CreateOption {
+	return func(o *createOptions) {
+		o.deployMode = m
+	}
+}
+
+func CreateWithGREMesh(g bool) CreateOption {
+	return func(o *createOptions) {
+		// Keep use GRE mesh enabled if enabled globally.
+		o.useGREMesh = o.useGREMesh || g
+	}
+}
+
+func CreateWithDefaultBridge(b string) CreateOption {
+	return func(o *createOptions) {
+		o.defaultBridge = b
 	}
 }
 

@@ -1,6 +1,13 @@
 package web
 
 import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"phenix/util/common"
+	"phenix/util/plog"
+	"phenix/web/rbac"
+	"phenix/web/weberror"
 	"strings"
 	"time"
 )
@@ -8,19 +15,15 @@ import (
 type ServerOption func(*serverOptions)
 
 type serverOptions struct {
-	endpoint   string
-	unixSocket string
-	users      []string
-	allowCORS  bool
+	endpoint  string
+	users     []string
+	allowCORS bool
 
 	tlsKeyPath string
 	tlsCrtPath string
 
 	logMiddleware string
-
-	publishLogs  bool
-	phenixLogs   string
-	minimegaLogs string
+	minimegaLogs  string
 
 	unbundled       bool
 	basePath        string
@@ -32,6 +35,8 @@ type serverOptions struct {
 	proxyAuthHeader string
 
 	features map[string]bool
+
+	unixSocketGid int
 }
 
 func newServerOptions(opts ...ServerOption) serverOptions {
@@ -47,16 +52,16 @@ func newServerOptions(opts ...ServerOption) serverOptions {
 		opt(&o)
 	}
 
-	if o.phenixLogs != "" || o.minimegaLogs != "" {
-		o.publishLogs = true
-	}
-
 	if !strings.HasPrefix(o.basePath, "/") {
 		o.basePath = "/" + o.basePath
 	}
 
 	if !strings.HasSuffix(o.basePath, "/") {
 		o.basePath = o.basePath + "/"
+	}
+
+	if _, err := os.Stat("downloads/tunneler"); err == nil {
+		o.features["tunneler-download"] = true
 	}
 
 	return o
@@ -82,12 +87,6 @@ func (this serverOptions) featured(f string) bool {
 func ServeOnEndpoint(e string) ServerOption {
 	return func(o *serverOptions) {
 		o.endpoint = e
-	}
-}
-
-func ServeOnUnixSocket(s string) ServerOption {
-	return func(o *serverOptions) {
-		o.unixSocket = s
 	}
 }
 
@@ -121,12 +120,6 @@ func ServeWithTLS(k, c string) ServerOption {
 func ServeWithMiddlewareLogging(l string) ServerOption {
 	return func(o *serverOptions) {
 		o.logMiddleware = l
-	}
-}
-
-func ServePhenixLogs(p string) ServerOption {
-	return func(o *serverOptions) {
-		o.phenixLogs = p
 	}
 }
 
@@ -180,4 +173,42 @@ func ServeWithFeatures(f []string) ServerOption {
 			}
 		}
 	}
+}
+
+func ServeWithUnixSocketGid(g int) ServerOption {
+	return func(o *serverOptions) {
+		o.unixSocketGid = g
+	}
+}
+
+// GET /options
+func GetOptions(w http.ResponseWriter, r *http.Request) error {
+	plog.Debug("HTTP handler called", "handler", "GetOptions")
+
+	var (
+		ctx  = r.Context()
+		role = ctx.Value("role").(rbac.Role)
+	)
+
+	if !role.Allowed("options", "list") {
+		err := weberror.NewWebError(nil, "listing options not allowed for %s", ctx.Value("user").(string))
+		return err.SetStatus(http.StatusForbidden)
+	}
+
+	options := map[string]any{
+		"bridge-mode":  common.BridgeMode,
+		"deploy-mode":  common.DeployMode,
+		"use-gre-mesh": common.UseGREMesh,
+	}
+
+	body, err := json.Marshal(options)
+	if err != nil {
+		err := weberror.NewWebError(err, "unable to process options")
+		return err.SetStatus(http.StatusInternalServerError)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(body)
+
+	return nil
 }

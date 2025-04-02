@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -18,13 +18,15 @@ import (
 	"phenix/store"
 	"phenix/types"
 	"phenix/util/notes"
+	"phenix/util/plog"
 	"phenix/web/broker"
 	"phenix/web/cache"
 	"phenix/web/rbac"
 	"phenix/web/util"
 	"phenix/web/weberror"
 
-	log "github.com/activeshadow/libminimega/minilog"
+	bt "phenix/web/broker/brokertypes"
+
 	assetfs "github.com/elazarl/go-bindata-assetfs"
 	"github.com/gorilla/mux"
 )
@@ -39,7 +41,7 @@ type builder struct {
 
 // GET /builder
 func GetBuilder(w http.ResponseWriter, r *http.Request) {
-	log.Debug("GetBuilder HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetBuilder")
 
 	if o.unbundled {
 		tmpl := template.Must(template.New("builder.html").ParseFiles("web/public/builder.html"))
@@ -59,7 +61,7 @@ func GetBuilder(w http.ResponseWriter, r *http.Request) {
 
 // POST /experiments/builder
 func CreateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("CreateExperimentFromBuilder HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "CreateExperimentFromBuilder")
 
 	var (
 		ctx  = r.Context()
@@ -71,7 +73,7 @@ func CreateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 		return err.SetStatus(http.StatusForbidden)
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return weberror.NewWebError(err, "reading request body").SetStatus(http.StatusInternalServerError)
 	}
@@ -117,8 +119,8 @@ func CreateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("configs", "list", config.FullName()),
-		broker.NewResource("config", config.FullName(), "create"),
+		bt.NewRequestPolicy("configs", "list", config.FullName()),
+		bt.NewResource("config", config.FullName(), "create"),
 		body,
 	)
 
@@ -175,7 +177,7 @@ func CreateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 
 	if warns := notes.Warnings(ctx, true); warns != nil {
 		for _, warn := range warns {
-			log.Warn("%v", warn)
+			plog.Warn("%v", warn)
 		}
 	}
 
@@ -193,8 +195,8 @@ func CreateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 	body, _ = json.Marshal(config)
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("configs", "list", config.FullName()),
-		broker.NewResource("config", config.FullName(), "create"),
+		bt.NewRequestPolicy("configs", "list", config.FullName()),
+		bt.NewResource("config", config.FullName(), "create"),
 		body,
 	)
 
@@ -207,8 +209,8 @@ func CreateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("experiments", "get", req.Name),
-		broker.NewResource("experiment", req.Name, "create"),
+		bt.NewRequestPolicy("experiments", "get", req.Name),
+		bt.NewResource("experiment", req.Name, "create"),
 		body,
 	)
 
@@ -217,7 +219,7 @@ func CreateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 
 // PUT /experiments/builder
 func UpdateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("UpdateExperimentFromBuilder HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "UpdateExperimentFromBuilder")
 
 	var (
 		ctx  = r.Context()
@@ -229,7 +231,7 @@ func UpdateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 		return err.SetStatus(http.StatusForbidden)
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return weberror.NewWebError(err, "reading request body").SetStatus(http.StatusInternalServerError)
 	}
@@ -282,8 +284,8 @@ func UpdateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("configs", "list", topo.FullName()),
-		broker.NewResource("config", topo.FullName(), "update"),
+		bt.NewRequestPolicy("configs", "list", topo.FullName()),
+		bt.NewResource("config", topo.FullName(), "update"),
 		body,
 	)
 
@@ -392,7 +394,7 @@ func UpdateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 
 		if warns := notes.Warnings(ctx, false); warns != nil {
 			for _, warn := range warns {
-				log.Warn("%v", warn)
+				plog.Warn("%v", warn)
 			}
 		}
 	}
@@ -416,8 +418,8 @@ func UpdateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("configs", "list", config.FullName()),
-		broker.NewResource("config", config.FullName(), action),
+		bt.NewRequestPolicy("configs", "list", config.FullName()),
+		bt.NewResource("config", config.FullName(), action),
 		body,
 	)
 
@@ -430,8 +432,8 @@ func UpdateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	broker.Broadcast(
-		broker.NewRequestPolicy("experiments", "get", req.Name),
-		broker.NewResource("experiment", req.Name, action),
+		bt.NewRequestPolicy("experiments", "get", req.Name),
+		bt.NewResource("experiment", req.Name, action),
 		body,
 	)
 
@@ -440,7 +442,7 @@ func UpdateExperimentFromBuilder(w http.ResponseWriter, r *http.Request) error {
 
 // POST /builder/save
 func SaveBuilderTopology(w http.ResponseWriter, r *http.Request) {
-	log.Debug("SaveBuilderTopology HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "SaveBuilderTopology")
 
 	name := r.FormValue("filename")
 	if name == "" {
@@ -452,7 +454,7 @@ func SaveBuilderTopology(w http.ResponseWriter, r *http.Request) {
 		format = "xml"
 	}
 
-	log.Info("saving builder file %s as %s", name, format)
+	plog.Info("saving builder file", "file", name, "format", format)
 
 	data, err := url.QueryUnescape(r.FormValue("xml"))
 	if err != nil {
@@ -468,7 +470,7 @@ func SaveBuilderTopology(w http.ResponseWriter, r *http.Request) {
 
 // GET /builder/topologies
 func GetBuilderTopologies(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("GetBuilderTopologies HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetBuilderTopologies")
 
 	var (
 		ctx  = r.Context()
@@ -509,7 +511,7 @@ func GetBuilderTopologies(w http.ResponseWriter, r *http.Request) error {
 
 // GET /builder/topologies/{name}
 func GetBuilderTopology(w http.ResponseWriter, r *http.Request) error {
-	log.Debug("GetBuilderTopology HTTP handler called")
+	plog.Debug("HTTP handler called", "handler", "GetBuilderTopology")
 
 	var (
 		ctx  = r.Context()

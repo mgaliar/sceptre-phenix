@@ -10,11 +10,14 @@ import (
 type Option func(*options)
 
 type options struct {
-	ns   string
-	vm   string
-	cpu  int
-	mem  int
-	disk string
+	ns     string
+	vm     string
+	cpu    int
+	mem    int
+	disk   string
+	bridge string
+
+	tags map[string]string
 
 	injectPart int
 	injects    []string
@@ -26,6 +29,11 @@ type options struct {
 	captureFile  string
 
 	screenshotSize string
+
+	// tunnels
+	srcPort int
+	dstPort int
+	dstHost string
 }
 
 func NewOptions(opts ...Option) options {
@@ -65,6 +73,18 @@ func Mem(m int) Option {
 func Disk(d string) Option {
 	return func(o *options) {
 		o.disk = d
+	}
+}
+
+func Bridge(b string) Option {
+	return func(o *options) {
+		o.bridge = b
+	}
+}
+
+func Tags(t map[string]string) Option {
+	return func(o *options) {
+		o.tags = t
 	}
 }
 
@@ -113,6 +133,24 @@ func CaptureFile(f string) Option {
 func ScreenshotSize(s string) Option {
 	return func(o *options) {
 		o.screenshotSize = s
+	}
+}
+
+func TunnelSourcePort(p int) Option {
+	return func(o *options) {
+		o.srcPort = p
+	}
+}
+
+func TunnelDestinationPort(p int) Option {
+	return func(o *options) {
+		o.dstPort = p
+	}
+}
+
+func TunnelDestinationHost(h string) Option {
+	return func(o *options) {
+		o.dstHost = h
 	}
 }
 
